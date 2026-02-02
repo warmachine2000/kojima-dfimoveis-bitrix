@@ -19,29 +19,28 @@
  * }
  *
  * Fonte no Bitrix:
- *  - "Portal DF Imóveis" → renomeamos a fonte "E-mail", então SOURCE_ID = "EMAIL"
+ *  - "Portal DF Imóveis" (ou renomeada internamente) -> SOURCE_ID
  */
 
 const BITRIX_WEBHOOK_URL = process.env.BITRIX_WEBHOOK_URL;
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || null;
 
-// (Opcional) responsável padrão (evita hardcode)
+// (Opcional) responsável padrão para atividades/atribuição futura (se quiser usar)
 const BITRIX_RESPONSIBLE_ID = process.env.BITRIX_RESPONSIBLE_ID
   ? Number(process.env.BITRIX_RESPONSIBLE_ID)
   : null;
 
-// Fonte DF Imóveis (ID interno da fonte que você renomeou de "E-mail")
+// Fonte DF Imóveis (ID interno da fonte no Bitrix)
 const SOURCE_DF_IMOVEIS = "EMAIL";
 
-// Se quiser uma fonte separada para 62 Imóveis no futuro, pode trocar isso aqui:
-const SOURCE_62_IMOVEIS = "EMAIL"; // ou "PORTAL_62IMOVEIS" se criar outra fonte
+// Se quiser fonte separada para 62 Imóveis no futuro:
+const SOURCE_62_IMOVEIS = "EMAIL"; // ex: "PORTAL_62IMOVEIS"
 
-// --------------- Funções auxiliares ---------------
+// ------------------ Utils ------------------
 
 function normalizePhone(ddd, phone) {
   const digitsDDD = (ddd || "").toString().replace(/\D/g, "");
   const digitsPhone = (phone || "").toString().replace(/\D/g, "");
-
   if (!digitsPhone) return null;
 
   // Brasil (+55)
@@ -49,12 +48,31 @@ function normalizePhone(ddd, phone) {
   return `+55${digitsPhone}`;
 }
 
+function safeStr(v) {
+  if (v === null || v === undefined) return "";
+  return String(v);
+}
+
+function pickToken(req) {
+  // 1) Authorization: Bearer <token>
+  const rawAuth = req.headers?.authorization || req.headers?.Authorization || "";
+  const bearer = safeStr(rawAuth).replace(/^Bearer\s+/i, "").trim();
+
+  // 2) Header alternativo (caso o portal não envie Bearer)
+  const xToken = safeStr(req.headers?.["x-webhook-token"]).trim();
+
+  // 3) Query token (caso portal só consiga mandar querystring)
+  const qToken = safeStr(req.query?.token).trim();
+
+  return bearer || xToken || qToken || "";
+}
+
 async function bitrixCall(method, params) {
   if (!BITRIX_WEBHOOK_URL) {
-    throw new Error("BITRIX_WEBHOOK_URL não definido nas variáveis de ambiente");
+    throw new Error("BITRIX_WEBHOOK_URL não definido");
   }
 
-  // Bitrix REST geralmente exige .json no final
+  // Bitrix REST exige .json
   const url = `${BITRIX_WEBHOOK_URL}/${method}.json`;
 
   const resp = await fetch(url, {
@@ -71,23 +89,15 @@ async function bitrixCall(method, params) {
   }
 
   if (!resp.ok) {
-    console.error(
-      `Bitrix request FAILED [${method}]`,
-      resp.status,
-      JSON.stringify(data, null, 2)
-    );
+    console.error(`Bitrix request FAILED [${method}]`, resp.status, data);
     throw new Error(
-      `BITRIX_REQUEST_FAILED (${resp.status}) [${method}]: ${JSON.stringify(
-        data
-      )}`
+      `BITRIX_REQUEST_FAILED (${resp.status}) [${method}] ${JSON.stringify(data)}`
     );
   }
 
-  if (data && data.error) {
+  if (data?.error) {
     throw new Error(
-      `BITRIX_API_ERROR [${method}] ${data.error}: ${
-        data.error_description || ""
-      }`
+      `BITRIX_API_ERROR [${method}] ${data.error}: ${data.error_description || ""}`
     );
   }
 
@@ -122,41 +132,54 @@ async function findDuplicate(phone, email) {
   return duplicates;
 }
 
+function getLeadIdFromDuplicates(duplicates) {
+  const leadFromPhone = duplicates?.PHONE?.LEAD?.[0];
+  const leadFromEmail = duplicates?.EMAIL?.LEAD?.[0];
+  return leadFromPhone || leadFromEmail || null;
+}
+
 function hasLeadDuplicate(duplicates) {
-  if (!duplicates) return false;
-  const leadIdsPhone = duplicates.PHONE?.LEAD || [];
-  const leadIdsEmail = duplicates.EMAIL?.LEAD || [];
+  const leadIdsPhone = duplicates?.PHONE?.LEAD || [];
+  const leadIdsEmail = duplicates?.EMAIL?.LEAD || [];
   return leadIdsPhone.length > 0 || leadIdsEmail.length > 0;
 }
 
-// --------------- Handler principal ---------------
+async function addTimelineCommentToLead(leadId, comment) {
+  // ✅ Em duplicidade, usar Timeline Comment (evita erro COMMUNICATIONS de crm.activity.add)
+  return bitrixCall("crm.timeline.comment.add", {
+    fields: {
+      ENTITY_TYPE: "lead", // Bitrix aceita "lead"
+      ENTITY_ID: Number(leadId),
+      COMMENT: comment,
+    },
+  });
+}
+
+// ------------------ Handler ------------------
 
 module.exports = async (req, res) => {
   try {
-    console.log("=== INÍCIO /api/dfimoveis ===");
+    console.log("=== INÍCIO /api/dfimoveis ===", new Date().toISOString());
     console.log("Method:", req.method);
 
     // CORS básico
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,X-Webhook-Token");
 
     if (req.method === "OPTIONS") {
       return res.status(200).end();
     }
 
-    // Aceita POST e GET (portais às vezes enviam GET)
+    // Aceita POST e GET
     if (req.method !== "POST" && req.method !== "GET") {
-      return res.status(405).json({ error: "Method not allowed" });
+      return res.status(405).json({ error: "METHOD_NOT_ALLOWED" });
     }
 
-    // Autenticação via Authorization: Bearer <token>
+    // Autenticação (se definido)
     if (WEBHOOK_TOKEN) {
-      const rawHeader =
-        req.headers["authorization"] || req.headers["Authorization"] || "";
-
-      const received = rawHeader.replace(/^Bearer\s+/i, "").trim();
-      const expected = WEBHOOK_TOKEN.replace(/^Bearer\s+/i, "").trim();
+      const received = pickToken(req);
+      const expected = safeStr(WEBHOOK_TOKEN).replace(/^Bearer\s+/i, "").trim();
 
       if (!received || received !== expected) {
         console.warn("Token inválido recebido em /api/dfimoveis");
@@ -188,7 +211,7 @@ module.exports = async (req, res) => {
       }
     }
 
-    console.log("Payload DF Imóveis recebido:", JSON.stringify(payload, null, 2));
+    console.log("Payload recebido:", JSON.stringify(payload, null, 2));
 
     const {
       clientListingId,
@@ -213,7 +236,7 @@ module.exports = async (req, res) => {
     }
 
     // Origem DFImoveis / 62imoveis
-    const originLower = (leadOrigin || "").toLowerCase();
+    const originLower = safeStr(leadOrigin).toLowerCase();
     const is62Imoveis = originLower === "62imoveis";
 
     let portalNome = "DF Imóveis";
@@ -229,44 +252,42 @@ module.exports = async (req, res) => {
     const fullPhone = normalizePhone(ddd, phone);
     const codigoImovel = clientListingId || originListingId || "NAO_INFORMADO";
 
-    // Duplicidade
+    // 1) Checa duplicidade
     const duplicates = await findDuplicate(fullPhone, email);
     const isDuplicate = hasLeadDuplicate(duplicates);
 
-    let leadId = null;
-
-    // ✅ DUPLICADO: cria comentário na timeline (em vez de crm.activity.add)
     if (isDuplicate) {
-      const leadFromPhone = duplicates.PHONE?.LEAD?.[0];
-      const leadFromEmail = duplicates.EMAIL?.LEAD?.[0];
-      leadId = leadFromPhone || leadFromEmail;
+      const leadId = getLeadIdFromDuplicates(duplicates);
 
       const comment =
-        `🔁 Novo contato ${portalNome} (duplicado) - ${codigoImovel}\n\n` +
-        `Mensagem: ${message || ""}\n\n` +
+        `🔁 *Novo contato (duplicado) - ${portalNome}*\n\n` +
+        `Imóvel: ${codigoImovel}\n` +
+        `Nome: ${name || "não informado"}\n` +
         `Telefone: ${fullPhone || "não informado"}\n` +
         `E-mail: ${email || "não informado"}\n\n` +
+        `Mensagem: ${message || ""}\n\n` +
         `clientListingId: ${clientListingId || ""}\n` +
         `originListingId: ${originListingId || ""}\n` +
         `originLeadId: ${originLeadId || ""}\n` +
         `leadOrigin: ${leadOrigin || ""}\n` +
         `timestamp: ${timestamp || ""}`;
 
-      await bitrixCall("crm.timeline.comment.add", {
-        fields: {
-          ENTITY_TYPE: "lead",
-          ENTITY_ID: leadId,
-          COMMENT: comment,
-        },
-      });
+      if (!leadId) {
+        return res.status(200).json({
+          status: "DUPLICATE_FOUND_BUT_NO_LEAD_ID",
+          duplicates,
+        });
+      }
 
-      return res.json({
+      await addTimelineCommentToLead(leadId, comment);
+
+      return res.status(200).json({
         status: "DUPLICATE_TIMELINE_COMMENT_CREATED",
         leadId,
       });
     }
 
-    // Novo lead
+    // 2) Cria novo Lead
     const leadFields = {
       TITLE: `${portalNome} | ${codigoImovel} | ${name || "Sem nome"}`,
       NAME: name || "Contato Portal",
@@ -282,7 +303,7 @@ module.exports = async (req, res) => {
         `originLeadId: ${originLeadId || ""}\n` +
         `timestamp: ${timestamp || ""}`,
 
-      // ⚠️ Ajuste se os códigos de UF forem diferentes no seu Bitrix
+      // ⚠️ Ajuste se os códigos UF forem diferentes no seu Bitrix
       UF_CODIGO_IMOVEL: codigoImovel,
       UF_PORTAL_ORIGEM: portalOrigemUF,
       UF_DFIMOVEIS_ORIGIN_LEAD_ID: originLeadId || "",
@@ -297,19 +318,16 @@ module.exports = async (req, res) => {
       leadFields.EMAIL = [{ VALUE: email, VALUE_TYPE: "WORK" }];
     }
 
+    // Se quiser setar responsável no Lead (opcional)
     if (BITRIX_RESPONSIBLE_ID) {
       leadFields.ASSIGNED_BY_ID = BITRIX_RESPONSIBLE_ID;
     }
 
-    console.log(
-      "LeadFields DF Imóveis enviados para crm.lead.add:",
-      JSON.stringify(leadFields, null, 2)
-    );
+    console.log("LeadFields enviados:", JSON.stringify(leadFields, null, 2));
 
-    const leadResult = await bitrixCall("crm.lead.add", { fields: leadFields });
-    leadId = leadResult;
+    const leadId = await bitrixCall("crm.lead.add", { fields: leadFields });
 
-    return res.json({
+    return res.status(200).json({
       status: "LEAD_CREATED",
       leadId,
     });
