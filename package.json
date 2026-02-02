@@ -1,10 +1,10 @@
 {
   "name": "kojima-dfimoveis-bitrix",
   "version": "1.0.0",
-  "description": "Integração DF Imóveis / 62 Imóveis → Bitrix24",
+  "description": "Integração DF Imóveis / 62 Imóveis -> Bitrix24",
   "private": true,
   "type": "commonjs",
   "engines": {
-    "node": "18.x"
+    "node": "20.x"
   }
 }
