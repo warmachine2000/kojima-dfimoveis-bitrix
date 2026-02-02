@@ -2,12 +2,30 @@
  * Integração DF Imóveis / 62 Imóveis  → Bitrix24
  * Autor: Adriano Alves
  * Projeto: kojima-dfimoveis-bitrix
+ *
+ * Payload esperado (padrão Grupo OLX/ZAP):
+ *
+ * {
+ *   "clientListingId": "a40171",
+ *   "name": "Nome Consumidor",
+ *   "email": "nome.consumidor@email.com",
+ *   "ddd": "61",
+ *   "phone": "999999999",
+ *   "message": "Olá, tenho interesse neste imóvel.",
+ *   "leadOrigin": "DFImoveis", // ou "62imoveis"
+ *   "timestamp": "2017-10-23T15:50:30.619Z",
+ *   "originLeadId": "59ee0fc6e4b043e1b2a6d863",
+ *   "originListingId": "87027856"
+ * }
+ *
+ * Fonte no Bitrix:
+ *  - "Portal DF Imóveis" → renomeamos a fonte "E-mail", então SOURCE_ID = "EMAIL"
  */
 
 const BITRIX_WEBHOOK_URL = process.env.BITRIX_WEBHOOK_URL;
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || null;
 
-// (Opcional) responsável padrão para atividades/criação (evita hardcode 1)
+// (Opcional) responsável padrão (evita hardcode)
 const BITRIX_RESPONSIBLE_ID = process.env.BITRIX_RESPONSIBLE_ID
   ? Number(process.env.BITRIX_RESPONSIBLE_ID)
   : null;
@@ -16,7 +34,7 @@ const BITRIX_RESPONSIBLE_ID = process.env.BITRIX_RESPONSIBLE_ID
 const SOURCE_DF_IMOVEIS = "EMAIL";
 
 // Se quiser uma fonte separada para 62 Imóveis no futuro, pode trocar isso aqui:
-const SOURCE_62_IMOVEIS = "EMAIL";
+const SOURCE_62_IMOVEIS = "EMAIL"; // ou "PORTAL_62IMOVEIS" se criar outra fonte
 
 // --------------- Funções auxiliares ---------------
 
@@ -31,48 +49,18 @@ function normalizePhone(ddd, phone) {
   return `+55${digitsPhone}`;
 }
 
-/**
- * Converte objeto em "x-www-form-urlencoded" com chaves tipo fields[NAME], fields[PHONE][0][VALUE], etc.
- */
-function toFormUrlEncoded(obj) {
-  const params = new URLSearchParams();
-
-  const build = (prefix, value) => {
-    if (value === undefined || value === null) return;
-
-    if (Array.isArray(value)) {
-      value.forEach((v, i) => build(`${prefix}[${i}]`, v));
-      return;
-    }
-
-    if (typeof value === "object") {
-      Object.entries(value).forEach(([k, v]) => build(`${prefix}[${k}]`, v));
-      return;
-    }
-
-    params.append(prefix, String(value));
-  };
-
-  Object.entries(obj || {}).forEach(([k, v]) => build(k, v));
-  return params;
-}
-
 async function bitrixCall(method, params) {
   if (!BITRIX_WEBHOOK_URL) {
     throw new Error("BITRIX_WEBHOOK_URL não definido nas variáveis de ambiente");
   }
 
-  // ✅ garante que a base não termina com "/"
-  const base = BITRIX_WEBHOOK_URL.replace(/\/+$/, "");
-  const url = `${base}/${method}.json`;
-
-  // ✅ Forma mais compatível com Bitrix: x-www-form-urlencoded
-  const body = toFormUrlEncoded(params);
+  // Bitrix REST geralmente exige .json no final
+  const url = `${BITRIX_WEBHOOK_URL}/${method}.json`;
 
   const resp = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params || {}),
   });
 
   let data = {};
@@ -88,13 +76,10 @@ async function bitrixCall(method, params) {
       resp.status,
       JSON.stringify(data, null, 2)
     );
-
-    const msg =
-      (data && (data.error_description || data.error)) ||
-      "Bitrix retornou erro sem descrição";
-
     throw new Error(
-      `BITRIX_REQUEST_FAILED (${resp.status}) [${method}] - ${msg}`
+      `BITRIX_REQUEST_FAILED (${resp.status}) [${method}]: ${JSON.stringify(
+        data
+      )}`
     );
   }
 
@@ -151,7 +136,7 @@ module.exports = async (req, res) => {
     console.log("=== INÍCIO /api/dfimoveis ===");
     console.log("Method:", req.method);
 
-    // ✅ CORS básico
+    // CORS básico
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
@@ -160,7 +145,7 @@ module.exports = async (req, res) => {
       return res.status(200).end();
     }
 
-    // ✅ Aceita POST e GET (portais às vezes enviam GET)
+    // Aceita POST e GET (portais às vezes enviam GET)
     if (req.method !== "POST" && req.method !== "GET") {
       return res.status(405).json({ error: "Method not allowed" });
     }
@@ -179,7 +164,7 @@ module.exports = async (req, res) => {
       }
     }
 
-    // ✅ Normaliza payload
+    // Normaliza payload
     let payload = {};
 
     if (req.method === "GET") {
@@ -218,6 +203,7 @@ module.exports = async (req, res) => {
       originListingId,
     } = payload;
 
+    // trava anti-lead vazio
     if (!name && !email && !phone) {
       return res.status(400).json({
         error: "MISSING_IDENTITY",
@@ -249,37 +235,33 @@ module.exports = async (req, res) => {
 
     let leadId = null;
 
+    // ✅ DUPLICADO: cria comentário na timeline (em vez de crm.activity.add)
     if (isDuplicate) {
       const leadFromPhone = duplicates.PHONE?.LEAD?.[0];
       const leadFromEmail = duplicates.EMAIL?.LEAD?.[0];
       leadId = leadFromPhone || leadFromEmail;
 
-      const activityFields = {
-        OWNER_ID: leadId,
-        OWNER_TYPE_ID: 1, // Lead
-        TYPE_ID: 4, // Task
-        SUBJECT: `Novo contato ${portalNome} (duplicado) - ${codigoImovel}`,
-        DESCRIPTION:
-          `Novo contato vindo do portal ${portalNome}.\n\n` +
-          `Mensagem: ${message || ""}\n\n` +
-          `Telefone: ${fullPhone || "não informado"}\n` +
-          `E-mail: ${email || "não informado"}\n\n` +
-          `clientListingId: ${clientListingId || ""}\n` +
-          `originListingId: ${originListingId || ""}\n` +
-          `originLeadId: ${originLeadId || ""}\n` +
-          `leadOrigin: ${leadOrigin || ""}\n` +
-          `timestamp: ${timestamp || ""}`,
-        COMPLETED: "N",
-      };
+      const comment =
+        `🔁 Novo contato ${portalNome} (duplicado) - ${codigoImovel}\n\n` +
+        `Mensagem: ${message || ""}\n\n` +
+        `Telefone: ${fullPhone || "não informado"}\n` +
+        `E-mail: ${email || "não informado"}\n\n` +
+        `clientListingId: ${clientListingId || ""}\n` +
+        `originListingId: ${originListingId || ""}\n` +
+        `originLeadId: ${originLeadId || ""}\n` +
+        `leadOrigin: ${leadOrigin || ""}\n` +
+        `timestamp: ${timestamp || ""}`;
 
-      if (BITRIX_RESPONSIBLE_ID) {
-        activityFields.RESPONSIBLE_ID = BITRIX_RESPONSIBLE_ID;
-      }
-
-      await bitrixCall("crm.activity.add", { fields: activityFields });
+      await bitrixCall("crm.timeline.comment.add", {
+        fields: {
+          ENTITY_TYPE: "lead",
+          ENTITY_ID: leadId,
+          COMMENT: comment,
+        },
+      });
 
       return res.json({
-        status: "DUPLICATE_ACTIVITY_CREATED",
+        status: "DUPLICATE_TIMELINE_COMMENT_CREATED",
         leadId,
       });
     }
@@ -300,8 +282,7 @@ module.exports = async (req, res) => {
         `originLeadId: ${originLeadId || ""}\n` +
         `timestamp: ${timestamp || ""}`,
 
-      // ⚠️ Se esses UF_* não existirem no Bitrix, vai dar erro.
-      // Se não tiver certeza, comente/remova esses 4 campos abaixo:
+      // ⚠️ Ajuste se os códigos de UF forem diferentes no seu Bitrix
       UF_CODIGO_IMOVEL: codigoImovel,
       UF_PORTAL_ORIGEM: portalOrigemUF,
       UF_DFIMOVEIS_ORIGIN_LEAD_ID: originLeadId || "",
@@ -314,6 +295,10 @@ module.exports = async (req, res) => {
 
     if (email) {
       leadFields.EMAIL = [{ VALUE: email, VALUE_TYPE: "WORK" }];
+    }
+
+    if (BITRIX_RESPONSIBLE_ID) {
+      leadFields.ASSIGNED_BY_ID = BITRIX_RESPONSIBLE_ID;
     }
 
     console.log(
