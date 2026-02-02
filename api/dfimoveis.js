@@ -25,6 +25,11 @@
 const BITRIX_WEBHOOK_URL = process.env.BITRIX_WEBHOOK_URL;
 const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || null;
 
+// (Opcional) responsável padrão para atividades/criação (evita hardcode 1)
+const BITRIX_RESPONSIBLE_ID = process.env.BITRIX_RESPONSIBLE_ID
+  ? Number(process.env.BITRIX_RESPONSIBLE_ID)
+  : null;
+
 // Fonte DF Imóveis (ID interno da fonte que você renomeou de "E-mail")
 const SOURCE_DF_IMOVEIS = "EMAIL";
 
@@ -51,7 +56,8 @@ async function bitrixCall(method, params) {
     throw new Error("BITRIX_WEBHOOK_URL não definido nas variáveis de ambiente");
   }
 
-  const url = `${BITRIX_WEBHOOK_URL}/${method}`;
+  // ✅ Bitrix REST exige .json
+  const url = `${BITRIX_WEBHOOK_URL}/${method}.json`;
 
   const resp = await fetch(url, {
     method: "POST",
@@ -59,7 +65,12 @@ async function bitrixCall(method, params) {
     body: JSON.stringify(params),
   });
 
-  const data = await resp.json().catch(() => ({}));
+  let data = {};
+  try {
+    data = await resp.json();
+  } catch (_) {
+    data = {};
+  }
 
   if (!resp.ok) {
     console.error(
@@ -125,9 +136,20 @@ function hasLeadDuplicate(duplicates) {
 module.exports = async (req, res) => {
   try {
     console.log("=== INÍCIO /api/dfimoveis ===");
+    console.log("Method:", req.method);
 
-    if (req.method !== "POST") {
+    // ✅ Aceita POST e GET (portais às vezes enviam GET)
+    if (req.method !== "POST" && req.method !== "GET") {
       return res.status(405).json({ error: "Method not allowed" });
+    }
+
+    // ✅ CORS básico (se algum portal/browser reclamar)
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+
+    if (req.method === "OPTIONS") {
+      return res.status(200).end();
     }
 
     // Autenticação via Authorization: Bearer <token>
@@ -144,20 +166,29 @@ module.exports = async (req, res) => {
       }
     }
 
-    if (!req.body) {
-      return res.status(400).json({ error: "EMPTY_BODY" });
-    }
-
+    // ✅ Normaliza payload
     let payload = {};
-    if (typeof req.body === "string") {
-      try {
-        payload = JSON.parse(req.body);
-      } catch (e) {
-        console.error("Erro parse JSON:", e);
-        return res.status(400).json({ error: "INVALID_JSON" });
-      }
+
+    if (req.method === "GET") {
+      payload = req.query || {};
     } else {
-      payload = req.body;
+      // POST
+      if (!req.body) {
+        // fallback (caso mandem parâmetros na query)
+        payload = req.query || {};
+        if (!payload || Object.keys(payload).length === 0) {
+          return res.status(400).json({ error: "EMPTY_BODY" });
+        }
+      } else if (typeof req.body === "string") {
+        try {
+          payload = JSON.parse(req.body);
+        } catch (e) {
+          console.error("Erro parse JSON:", e);
+          return res.status(400).json({ error: "INVALID_JSON" });
+        }
+      } else {
+        payload = req.body;
+      }
     }
 
     console.log("Payload DF Imóveis recebido:", JSON.stringify(payload, null, 2));
@@ -175,15 +206,17 @@ module.exports = async (req, res) => {
       originListingId,
     } = payload;
 
+    // ✅ trava anti-lead vazio
     if (!name && !email && !phone) {
-      return res
-        .status(400)
-        .json({ error: "Precisa de ao menos nome, e-mail ou telefone" });
+      return res.status(400).json({
+        error: "MISSING_IDENTITY",
+        message: "Precisa de ao menos nome, e-mail ou telefone",
+        receivedKeys: Object.keys(payload || {}),
+      });
     }
 
     // Origem DFImoveis / 62imoveis
     const originLower = (leadOrigin || "").toLowerCase();
-    const isDFImoveis = originLower === "dfimoveis";
     const is62Imoveis = originLower === "62imoveis";
 
     let portalNome = "DF Imóveis";
@@ -210,26 +243,29 @@ module.exports = async (req, res) => {
       const leadFromEmail = duplicates.EMAIL?.LEAD?.[0];
       leadId = leadFromPhone || leadFromEmail;
 
-      await bitrixCall("crm.activity.add", {
-        fields: {
-          OWNER_ID: leadId,
-          OWNER_TYPE_ID: 1, // Lead
-          TYPE_ID: 4, // Task
-          SUBJECT: `Novo contato ${portalNome} (duplicado) - ${codigoImovel}`,
-          DESCRIPTION:
-            `Novo contato vindo do portal ${portalNome}.\n\n` +
-            `Mensagem: ${message || ""}\n\n` +
-            `Telefone: ${fullPhone || "não informado"}\n` +
-            `E-mail: ${email || "não informado"}\n\n` +
-            `clientListingId: ${clientListingId || ""}\n` +
-            `originListingId: ${originListingId || ""}\n` +
-            `originLeadId: ${originLeadId || ""}\n` +
-            `leadOrigin: ${leadOrigin || ""}\n` +
-            `timestamp: ${timestamp || ""}`,
-          RESPONSIBLE_ID: 1,
-          COMPLETED: "N",
-        },
-      });
+      const activityFields = {
+        OWNER_ID: leadId,
+        OWNER_TYPE_ID: 1, // Lead
+        TYPE_ID: 4, // Task
+        SUBJECT: `Novo contato ${portalNome} (duplicado) - ${codigoImovel}`,
+        DESCRIPTION:
+          `Novo contato vindo do portal ${portalNome}.\n\n` +
+          `Mensagem: ${message || ""}\n\n` +
+          `Telefone: ${fullPhone || "não informado"}\n` +
+          `E-mail: ${email || "não informado"}\n\n` +
+          `clientListingId: ${clientListingId || ""}\n` +
+          `originListingId: ${originListingId || ""}\n` +
+          `originLeadId: ${originLeadId || ""}\n` +
+          `leadOrigin: ${leadOrigin || ""}\n` +
+          `timestamp: ${timestamp || ""}`,
+        COMPLETED: "N",
+      };
+
+      if (BITRIX_RESPONSIBLE_ID) {
+        activityFields.RESPONSIBLE_ID = BITRIX_RESPONSIBLE_ID;
+      }
+
+      await bitrixCall("crm.activity.add", { fields: activityFields });
 
       return res.json({
         status: "DUPLICATE_ACTIVITY_CREATED",
@@ -254,7 +290,6 @@ module.exports = async (req, res) => {
         `timestamp: ${timestamp || ""}`,
 
       // ⚠️ AJUSTE ESTES CÓDIGOS DE CAMPOS PERSONALIZADOS
-      // para os códigos reais criados no Bitrix, se forem diferentes:
       UF_CODIGO_IMOVEL: codigoImovel,
       UF_PORTAL_ORIGEM: portalOrigemUF,
       UF_DFIMOVEIS_ORIGIN_LEAD_ID: originLeadId || "",
@@ -262,21 +297,11 @@ module.exports = async (req, res) => {
     };
 
     if (fullPhone) {
-      leadFields.PHONE = [
-        {
-          VALUE: fullPhone,
-          VALUE_TYPE: "WORK",
-        },
-      ];
+      leadFields.PHONE = [{ VALUE: fullPhone, VALUE_TYPE: "WORK" }];
     }
 
     if (email) {
-      leadFields.EMAIL = [
-        {
-          VALUE: email,
-          VALUE_TYPE: "WORK",
-        },
-      ];
+      leadFields.EMAIL = [{ VALUE: email, VALUE_TYPE: "WORK" }];
     }
 
     console.log(
@@ -284,10 +309,7 @@ module.exports = async (req, res) => {
       JSON.stringify(leadFields, null, 2)
     );
 
-    const leadResult = await bitrixCall("crm.lead.add", {
-      fields: leadFields,
-    });
-
+    const leadResult = await bitrixCall("crm.lead.add", { fields: leadFields });
     leadId = leadResult;
 
     return res.json({
