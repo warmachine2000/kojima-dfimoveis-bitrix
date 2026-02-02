@@ -3,19 +3,19 @@
  * Autor: Adriano Alves
  * Projeto: kojima-dfimoveis-bitrix
  *
- * Payload esperado (padrão Grupo OLX/ZAP + extras opcionais):
+ * Payload esperado (padrão Grupo OLX/ZAP):
  * {
  *   "clientListingId": "a40171",
  *   "name": "Nome Consumidor",
- *   "email": "nome@email.com",
+ *   "email": "nome.consumidor@email.com",
  *   "ddd": "61",
  *   "phone": "999999999",
- *   "message": "Olá, tenho interesse neste imóvel. https://...",
+ *   "message": "Olá, tenho interesse neste imóvel.",
  *   "leadOrigin": "DFImoveis", // ou "62imoveis"
  *   "timestamp": "2017-10-23T15:50:30.619Z",
  *   "originLeadId": "59ee0fc6e4b043e1b2a6d863",
  *   "originListingId": "87027856",
- *   "listingUrl": "https://www.dfimoveis.com.br/imovel/..."
+ *   "listingUrl": "https://www.dfimoveis.com.br/imovel/ABC123" // (se enviar)
  * }
  *
  * Fonte no Bitrix:
@@ -24,18 +24,16 @@
 
 const BITRIX_WEBHOOK_URL = process.env.BITRIX_WEBHOOK_URL;
 
-// Token (opcional) — por padrão DESLIGADO
-const WEBHOOK_TOKEN = process.env.WEBHOOK_TOKEN || null;
-
+// (Opcional) responsável padrão
 const BITRIX_RESPONSIBLE_ID = process.env.BITRIX_RESPONSIBLE_ID
   ? Number(process.env.BITRIX_RESPONSIBLE_ID)
   : null;
 
 // Fonte DF Imóveis (ID interno da fonte que você renomeou de "E-mail")
 const SOURCE_DF_IMOVEIS = "EMAIL";
-const SOURCE_62_IMOVEIS = "EMAIL";
+const SOURCE_62_IMOVEIS = "EMAIL"; // se criar outra fonte, troque aqui
 
-// ---------------- Helpers ----------------
+// --------------- Funções auxiliares ---------------
 
 function normalizePhone(ddd, phone) {
   const digitsDDD = (ddd || "").toString().replace(/\D/g, "");
@@ -45,52 +43,65 @@ function normalizePhone(ddd, phone) {
   return `+55${digitsPhone}`;
 }
 
-function extractUrl(text) {
-  if (!text) return null;
-  const match = text.toString().match(/https?:\/\/\S+/i);
-  return match ? match[0] : null;
+function normalizeEmail(email) {
+  const e = (email || "").toString().trim().toLowerCase();
+  return e || null;
+}
+
+function safeStr(v) {
+  return (v === undefined || v === null) ? "" : String(v);
+}
+
+function buildListingUrl(listingUrl, originListingId, clientListingId) {
+  // se o portal mandar URL, usamos ela
+  if (listingUrl) return String(listingUrl);
+
+  // fallback simples (se quiser, depois ajustamos pro padrão real do DF Imóveis)
+  const code = clientListingId || originListingId;
+  if (code) return `https://www.dfimoveis.com.br/imovel/${encodeURIComponent(code)}`;
+
+  return "";
 }
 
 function buildTimelineMessage({
   portalNome,
   leadOrigin,
-  message,
   codigoImovel,
   listingUrl,
+  name,
+  fullPhone,
+  email,
+  message,
   clientListingId,
   originListingId,
   originLeadId,
   timestamp,
-  name,
-  email,
-  fullPhone,
 }) {
-  const url = listingUrl || extractUrl(message) || "";
-  const msg = (message || "").toString().trim();
+  const urlLine = listingUrl ? `🔗 Link do anúncio: ${listingUrl}\n` : "";
 
   return (
-    `🧲 Novo contato (${portalNome})\n` +
-    `----------------------------------\n` +
-    `👤 Nome: ${name || "não informado"}\n` +
-    `📞 Telefone: ${fullPhone || "não informado"}\n` +
-    `✉️ E-mail: ${email || "não informado"}\n\n` +
-    `🏷️ Código do anúncio: ${codigoImovel || "não informado"}\n` +
-    `🔗 URL do anúncio: ${url || "não informado"}\n\n` +
-    `💬 Mensagem:\n${msg || "(vazia)"}\n\n` +
-    `ℹ️ Metadados:\n` +
-    `- leadOrigin: ${leadOrigin || ""}\n` +
-    `- clientListingId: ${clientListingId || ""}\n` +
-    `- originListingId: ${originListingId || ""}\n` +
-    `- originLeadId: ${originLeadId || ""}\n` +
-    `- timestamp: ${timestamp || ""}\n`
+    `📩 *Novo contato - ${portalNome}*\n\n` +
+    `🏷 Código do anúncio: ${codigoImovel}\n` +
+    urlLine +
+    `👤 Nome: ${safeStr(name) || "Não informado"}\n` +
+    `📞 Telefone: ${fullPhone || "Não informado"}\n` +
+    `✉️ E-mail: ${email || "Não informado"}\n` +
+    `🧭 leadOrigin: ${leadOrigin || ""}\n\n` +
+    `📝 Mensagem:\n${safeStr(message) || "(vazia)"}\n\n` +
+    `-- Dados técnicos --\n` +
+    `clientListingId: ${safeStr(clientListingId)}\n` +
+    `originListingId: ${safeStr(originListingId)}\n` +
+    `originLeadId: ${safeStr(originLeadId)}\n` +
+    `timestamp: ${safeStr(timestamp)}\n`
   );
 }
 
 async function bitrixCall(method, params) {
   if (!BITRIX_WEBHOOK_URL) {
-    throw new Error("BITRIX_WEBHOOK_URL não definido");
+    throw new Error("BITRIX_WEBHOOK_URL não definido nas variáveis de ambiente");
   }
 
+  // Bitrix REST exige .json no final
   const url = `${BITRIX_WEBHOOK_URL}/${method}.json`;
 
   const resp = await fetch(url, {
@@ -107,10 +118,9 @@ async function bitrixCall(method, params) {
   }
 
   if (!resp.ok) {
+    console.error(`Bitrix request FAILED [${method}]`, resp.status, data);
     throw new Error(
-      `BITRIX_REQUEST_FAILED (${resp.status}) [${method}] - ${
-        data?.error_description || data?.error || JSON.stringify(data)
-      }`
+      `BITRIX_REQUEST_FAILED (${resp.status}) [${method}] - ${JSON.stringify(data)}`
     );
   }
 
@@ -132,7 +142,9 @@ async function findDuplicate(phone, email) {
         type: "PHONE",
         values: [phone],
       });
-    } catch (_) {}
+    } catch (e) {
+      console.warn("Erro duplicidade telefone:", e.message);
+    }
   }
 
   if (email) {
@@ -141,70 +153,77 @@ async function findDuplicate(phone, email) {
         type: "EMAIL",
         values: [email],
       });
-    } catch (_) {}
+    } catch (e) {
+      console.warn("Erro duplicidade email:", e.message);
+    }
   }
 
   return duplicates;
 }
 
-function hasLeadDuplicate(duplicates) {
-  const leadIdsPhone = duplicates?.PHONE?.LEAD || [];
-  const leadIdsEmail = duplicates?.EMAIL?.LEAD || [];
-  return leadIdsPhone.length > 0 || leadIdsEmail.length > 0;
+function pickLeadIdFromDuplicates(duplicates) {
+  const leadFromPhone = duplicates?.PHONE?.LEAD?.[0];
+  const leadFromEmail = duplicates?.EMAIL?.LEAD?.[0];
+  return leadFromPhone || leadFromEmail || null;
 }
 
-async function addTimelineComment(leadId, message) {
-  // Bitrix timeline comment
+async function addTimelineCommentToLead(leadId, commentText) {
+  // ✅ Isso é o que aparece de verdade na timeline
   return bitrixCall("crm.timeline.comment.add", {
     fields: {
       ENTITY_TYPE: "lead",
       ENTITY_ID: Number(leadId),
-      COMMENT: message,
+      COMMENT: commentText,
     },
   });
 }
 
-// ---------------- Handler ----------------
+// --------------- Handler principal ---------------
 
 module.exports = async (req, res) => {
   try {
-    // CORS
+    console.log("=== INÍCIO /api/dfimoveis ===");
+    console.log("Method:", req.method);
+
+    // CORS básico
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
 
-    if (req.method === "OPTIONS") return res.status(200).end();
+    if (req.method === "OPTIONS") {
+      return res.status(200).end();
+    }
 
+    // Aceita POST e GET
     if (req.method !== "POST" && req.method !== "GET") {
       return res.status(405).json({ error: "Method not allowed" });
     }
 
-    // Token opcional (se você NÃO quiser, é só não setar WEBHOOK_TOKEN)
-    if (WEBHOOK_TOKEN) {
-      const rawHeader = req.headers["authorization"] || req.headers["Authorization"] || "";
-      const received = rawHeader.replace(/^Bearer\s+/i, "").trim();
-      const expected = WEBHOOK_TOKEN.replace(/^Bearer\s+/i, "").trim();
-      if (!received || received !== expected) {
-        return res.status(401).json({ error: "INVALID_TOKEN" });
-      }
-    }
-
-    // Normaliza payload
+    // ✅ Normaliza payload
     let payload = {};
+
     if (req.method === "GET") {
       payload = req.query || {};
     } else {
-      if (!req.body) payload = req.query || {};
-      else if (typeof req.body === "string") {
+      // POST
+      if (!req.body) {
+        payload = req.query || {};
+        if (!payload || Object.keys(payload).length === 0) {
+          return res.status(400).json({ error: "EMPTY_BODY" });
+        }
+      } else if (typeof req.body === "string") {
         try {
           payload = JSON.parse(req.body);
-        } catch (_) {
+        } catch (e) {
+          console.error("Erro parse JSON:", e);
           return res.status(400).json({ error: "INVALID_JSON" });
         }
       } else {
         payload = req.body;
       }
     }
+
+    console.log("Payload recebido:", JSON.stringify(payload, null, 2));
 
     const {
       clientListingId,
@@ -220,14 +239,16 @@ module.exports = async (req, res) => {
       listingUrl,
     } = payload;
 
+    // trava anti-lead vazio
     if (!name && !email && !phone) {
       return res.status(400).json({
         error: "MISSING_IDENTITY",
         message: "Precisa de ao menos nome, e-mail ou telefone",
+        receivedKeys: Object.keys(payload || {}),
       });
     }
 
-    const originLower = (leadOrigin || "").toLowerCase();
+    const originLower = (leadOrigin || "").toString().toLowerCase();
     const is62Imoveis = originLower === "62imoveis";
 
     let portalNome = "DF Imóveis";
@@ -241,38 +262,38 @@ module.exports = async (req, res) => {
     }
 
     const fullPhone = normalizePhone(ddd, phone);
+    const emailNorm = normalizeEmail(email);
+
     const codigoImovel = clientListingId || originListingId || "NAO_INFORMADO";
+    const anuncioUrl = buildListingUrl(listingUrl, originListingId, clientListingId);
 
     // Duplicidade
-    const duplicates = await findDuplicate(fullPhone, email);
-    const isDuplicate = hasLeadDuplicate(duplicates);
+    const duplicates = await findDuplicate(fullPhone, emailNorm);
+    const duplicatedLeadId = pickLeadIdFromDuplicates(duplicates);
 
-    // Monta mensagem definitiva (TIMELINE)
+    // ✅ Monta o comentário definitivo (timeline)
     const timelineText = buildTimelineMessage({
       portalNome,
       leadOrigin,
-      message,
       codigoImovel,
-      listingUrl,
+      listingUrl: anuncioUrl,
+      name,
+      fullPhone,
+      email: emailNorm,
+      message,
       clientListingId,
       originListingId,
       originLeadId,
       timestamp,
-      name,
-      email,
-      fullPhone,
     });
 
-    if (isDuplicate) {
-      const leadId =
-        duplicates?.PHONE?.LEAD?.[0] || duplicates?.EMAIL?.LEAD?.[0];
-
-      // ✅ Aqui é o principal: comentar na TIMELINE (é o que aparece na tela)
-      await addTimelineComment(leadId, `⚠️ DUPLICADO\n\n${timelineText}`);
+    // Se duplicou: comenta na timeline do lead existente e encerra
+    if (duplicatedLeadId) {
+      await addTimelineCommentToLead(duplicatedLeadId, timelineText);
 
       return res.json({
         status: "DUPLICATE_TIMELINE_COMMENT_CREATED",
-        leadId: Number(leadId),
+        leadId: duplicatedLeadId,
       });
     }
 
@@ -283,34 +304,37 @@ module.exports = async (req, res) => {
       SOURCE_ID: sourceId,
       SOURCE_DESCRIPTION: `Lead vindo do portal ${portalNome}`,
 
-      // Ainda grava COMMENTS (se seu Bitrix mostrar)
+      // pode manter, mas o que garante timeline é o crm.timeline.comment.add
       COMMENTS: timelineText,
 
-      // Se esses UF não existirem, Bitrix costuma ignorar sem erro em algumas contas;
-      // Se der erro em algum momento, você remove estes 4.
+      // ⚠️ Ajuste se seus UF_* forem diferentes
       UF_CODIGO_IMOVEL: codigoImovel,
       UF_PORTAL_ORIGEM: portalOrigemUF,
       UF_DFIMOVEIS_ORIGIN_LEAD_ID: originLeadId || "",
       UF_DFIMOVEIS_ORIGIN_LISTING_ID: originListingId || "",
     };
 
-    if (fullPhone) leadFields.PHONE = [{ VALUE: fullPhone, VALUE_TYPE: "WORK" }];
-    if (email) leadFields.EMAIL = [{ VALUE: email, VALUE_TYPE: "WORK" }];
-
-    if (BITRIX_RESPONSIBLE_ID) {
-      leadFields.ASSIGNED_BY_ID = BITRIX_RESPONSIBLE_ID;
+    if (fullPhone) {
+      leadFields.PHONE = [{ VALUE: fullPhone, VALUE_TYPE: "WORK" }];
     }
+    if (emailNorm) {
+      leadFields.EMAIL = [{ VALUE: emailNorm, VALUE_TYPE: "WORK" }];
+    }
+
+    console.log("LeadFields enviados:", JSON.stringify(leadFields, null, 2));
 
     const leadId = await bitrixCall("crm.lead.add", { fields: leadFields });
 
-    // ✅ E aqui garante aparecer na tela (timeline)
-    await addTimelineComment(leadId, timelineText);
+    // ✅ GARANTE o comentário na TIMELINE
+    await addTimelineCommentToLead(leadId, timelineText);
 
     return res.json({
       status: "LEAD_CREATED",
-      leadId: Number(leadId),
+      leadId,
     });
   } catch (err) {
+    console.error("ERRO GERAL /api/dfimoveis:", err);
+
     return res.status(500).json({
       error: "INTERNAL_ERROR",
       message: err.message,
