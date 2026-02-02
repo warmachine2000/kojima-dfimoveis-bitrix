@@ -2,38 +2,23 @@
  * Integração DF Imóveis / 62 Imóveis  → Bitrix24
  * Autor: Adriano Alves
  * Projeto: kojima-dfimoveis-bitrix
- *
- * Payload esperado (padrão Grupo OLX/ZAP):
- * {
- *   "clientListingId": "a40171",
- *   "name": "Nome Consumidor",
- *   "email": "nome.consumidor@email.com",
- *   "ddd": "61",
- *   "phone": "999999999",
- *   "message": "Olá, tenho interesse neste imóvel.",
- *   "leadOrigin": "DFImoveis", // ou "62imoveis"
- *   "timestamp": "2017-10-23T15:50:30.619Z",
- *   "originLeadId": "59ee0fc6e4b043e1b2a6d863",
- *   "originListingId": "87027856",
- *   "listingUrl": "https://www.dfimoveis.com.br/imovel/ABC123" // (se enviar)
- * }
- *
- * Fonte no Bitrix:
- *  - "Portal DF Imóveis" → renomeamos a fonte "E-mail", então SOURCE_ID = "EMAIL"
  */
 
 const BITRIX_WEBHOOK_URL = process.env.BITRIX_WEBHOOK_URL;
 
-// (Opcional) responsável padrão
-const BITRIX_RESPONSIBLE_ID = process.env.BITRIX_RESPONSIBLE_ID
-  ? Number(process.env.BITRIX_RESPONSIBLE_ID)
-  : null;
-
 // Fonte DF Imóveis (ID interno da fonte que você renomeou de "E-mail")
 const SOURCE_DF_IMOVEIS = "EMAIL";
-const SOURCE_62_IMOVEIS = "EMAIL"; // se criar outra fonte, troque aqui
+const SOURCE_62_IMOVEIS = "EMAIL";
 
-// --------------- Funções auxiliares ---------------
+// Cache em memória (Vercel reaproveita em warm starts)
+let CACHED_LEAD_FIELDS = null;
+let CACHED_COMMENT_FIELD_KEY = null;
+
+// ---------------- Helpers ----------------
+
+function safeStr(v) {
+  return v === undefined || v === null ? "" : String(v);
+}
 
 function normalizePhone(ddd, phone) {
   const digitsDDD = (ddd || "").toString().replace(/\D/g, "");
@@ -48,18 +33,17 @@ function normalizeEmail(email) {
   return e || null;
 }
 
-function safeStr(v) {
-  return (v === undefined || v === null) ? "" : String(v);
+function stripAccents(s) {
+  return (s || "")
+    .toString()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
 }
 
 function buildListingUrl(listingUrl, originListingId, clientListingId) {
-  // se o portal mandar URL, usamos ela
   if (listingUrl) return String(listingUrl);
-
-  // fallback simples (se quiser, depois ajustamos pro padrão real do DF Imóveis)
   const code = clientListingId || originListingId;
   if (code) return `https://www.dfimoveis.com.br/imovel/${encodeURIComponent(code)}`;
-
   return "";
 }
 
@@ -101,13 +85,12 @@ async function bitrixCall(method, params) {
     throw new Error("BITRIX_WEBHOOK_URL não definido nas variáveis de ambiente");
   }
 
-  // Bitrix REST exige .json no final
   const url = `${BITRIX_WEBHOOK_URL}/${method}.json`;
 
   const resp = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(params),
+    body: JSON.stringify(params || {}),
   });
 
   let data = {};
@@ -131,6 +114,53 @@ async function bitrixCall(method, params) {
   }
 
   return data.result;
+}
+
+/**
+ * Descobre automaticamente qual campo do LEAD tem título "Comentário".
+ * Isso resolve quando o seu layout mostra um UF_* chamado "Comentário".
+ */
+async function resolveLeadCommentFieldKey() {
+  if (CACHED_COMMENT_FIELD_KEY) return CACHED_COMMENT_FIELD_KEY;
+
+  // Se já temos os fields em cache, usa
+  if (!CACHED_LEAD_FIELDS) {
+    CACHED_LEAD_FIELDS = await bitrixCall("crm.lead.fields", {});
+  }
+
+  // Tentativa 1: achar campo cujo title/FORM_LABEL seja "Comentário"
+  const target = "comentario";
+
+  for (const [key, def] of Object.entries(CACHED_LEAD_FIELDS || {})) {
+    const title = stripAccents(def?.title || "").toLowerCase().trim();
+    const formLabel = stripAccents(def?.formLabel || def?.form_label || "").toLowerCase().trim();
+    const listLabel = stripAccents(def?.listLabel || def?.list_label || "").toLowerCase().trim();
+
+    const joined = [title, formLabel, listLabel].filter(Boolean).join(" | ");
+
+    if (joined.includes(target)) {
+      // Preferir campos de texto
+      const type = (def?.type || "").toLowerCase();
+      if (type === "text" || type === "string") {
+        CACHED_COMMENT_FIELD_KEY = key;
+        return CACHED_COMMENT_FIELD_KEY;
+      }
+    }
+  }
+
+  // Tentativa 2: fallback seguro: COMMENTS (campo padrão)
+  CACHED_COMMENT_FIELD_KEY = "COMMENTS";
+  return CACHED_COMMENT_FIELD_KEY;
+}
+
+async function addTimelineCommentToLead(leadId, commentText) {
+  return bitrixCall("crm.timeline.comment.add", {
+    fields: {
+      ENTITY_TYPE: "lead",
+      ENTITY_ID: Number(leadId),
+      COMMENT: commentText,
+    },
+  });
 }
 
 async function findDuplicate(phone, email) {
@@ -167,63 +197,33 @@ function pickLeadIdFromDuplicates(duplicates) {
   return leadFromPhone || leadFromEmail || null;
 }
 
-async function addTimelineCommentToLead(leadId, commentText) {
-  // ✅ Isso é o que aparece de verdade na timeline
-  return bitrixCall("crm.timeline.comment.add", {
-    fields: {
-      ENTITY_TYPE: "lead",
-      ENTITY_ID: Number(leadId),
-      COMMENT: commentText,
-    },
-  });
-}
-
-// --------------- Handler principal ---------------
+// ---------------- Handler ----------------
 
 module.exports = async (req, res) => {
   try {
-    console.log("=== INÍCIO /api/dfimoveis ===");
-    console.log("Method:", req.method);
-
     // CORS básico
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
 
-    if (req.method === "OPTIONS") {
-      return res.status(200).end();
-    }
-
-    // Aceita POST e GET
+    if (req.method === "OPTIONS") return res.status(200).end();
     if (req.method !== "POST" && req.method !== "GET") {
       return res.status(405).json({ error: "Method not allowed" });
     }
 
-    // ✅ Normaliza payload
+    // Payload
     let payload = {};
-
     if (req.method === "GET") {
       payload = req.query || {};
     } else {
-      // POST
       if (!req.body) {
         payload = req.query || {};
-        if (!payload || Object.keys(payload).length === 0) {
-          return res.status(400).json({ error: "EMPTY_BODY" });
-        }
       } else if (typeof req.body === "string") {
-        try {
-          payload = JSON.parse(req.body);
-        } catch (e) {
-          console.error("Erro parse JSON:", e);
-          return res.status(400).json({ error: "INVALID_JSON" });
-        }
+        payload = JSON.parse(req.body);
       } else {
         payload = req.body;
       }
     }
-
-    console.log("Payload recebido:", JSON.stringify(payload, null, 2));
 
     const {
       clientListingId,
@@ -239,12 +239,10 @@ module.exports = async (req, res) => {
       listingUrl,
     } = payload;
 
-    // trava anti-lead vazio
     if (!name && !email && !phone) {
       return res.status(400).json({
         error: "MISSING_IDENTITY",
         message: "Precisa de ao menos nome, e-mail ou telefone",
-        receivedKeys: Object.keys(payload || {}),
       });
     }
 
@@ -267,12 +265,7 @@ module.exports = async (req, res) => {
     const codigoImovel = clientListingId || originListingId || "NAO_INFORMADO";
     const anuncioUrl = buildListingUrl(listingUrl, originListingId, clientListingId);
 
-    // Duplicidade
-    const duplicates = await findDuplicate(fullPhone, emailNorm);
-    const duplicatedLeadId = pickLeadIdFromDuplicates(duplicates);
-
-    // ✅ Monta o comentário definitivo (timeline)
-    const timelineText = buildTimelineMessage({
+    const commentText = buildTimelineMessage({
       portalNome,
       leadOrigin,
       codigoImovel,
@@ -287,54 +280,68 @@ module.exports = async (req, res) => {
       timestamp,
     });
 
-    // Se duplicou: comenta na timeline do lead existente e encerra
+    // Descobre campo real "Comentário" do seu layout
+    const commentFieldKey = await resolveLeadCommentFieldKey();
+
+    // Duplicidade
+    const duplicates = await findDuplicate(fullPhone, emailNorm);
+    const duplicatedLeadId = pickLeadIdFromDuplicates(duplicates);
+
     if (duplicatedLeadId) {
-      await addTimelineCommentToLead(duplicatedLeadId, timelineText);
+      // ✅ 1) Timeline
+      await addTimelineCommentToLead(duplicatedLeadId, commentText);
+
+      // ✅ 2) Campo do formulário (o que você chamou de "campo correto")
+      // atualiza o lead duplicado com o comentário também
+      await bitrixCall("crm.lead.update", {
+        id: Number(duplicatedLeadId),
+        fields: {
+          [commentFieldKey]: commentText,
+          COMMENTS: commentText, // mantém também o padrão
+        },
+      });
 
       return res.json({
-        status: "DUPLICATE_TIMELINE_COMMENT_CREATED",
+        status: "DUPLICATE_UPDATED_WITH_COMMENT",
         leadId: duplicatedLeadId,
+        commentFieldKey,
       });
     }
 
-    // Novo lead
+    // Novo Lead
     const leadFields = {
       TITLE: `${portalNome} | ${codigoImovel} | ${name || "Sem nome"}`,
       NAME: name || "Contato Portal",
       SOURCE_ID: sourceId,
       SOURCE_DESCRIPTION: `Lead vindo do portal ${portalNome}`,
 
-      // pode manter, mas o que garante timeline é o crm.timeline.comment.add
-      COMMENTS: timelineText,
+      // ✅ Preenche os dois: campo padrão + campo do seu layout
+      COMMENTS: commentText,
+      [commentFieldKey]: commentText,
 
-      // ⚠️ Ajuste se seus UF_* forem diferentes
+      // ⚠️ Esses UF_* só mantenha se existirem no seu Bitrix.
+      // Se não existirem, comente essas linhas.
       UF_CODIGO_IMOVEL: codigoImovel,
       UF_PORTAL_ORIGEM: portalOrigemUF,
       UF_DFIMOVEIS_ORIGIN_LEAD_ID: originLeadId || "",
       UF_DFIMOVEIS_ORIGIN_LISTING_ID: originListingId || "",
     };
 
-    if (fullPhone) {
-      leadFields.PHONE = [{ VALUE: fullPhone, VALUE_TYPE: "WORK" }];
-    }
-    if (emailNorm) {
-      leadFields.EMAIL = [{ VALUE: emailNorm, VALUE_TYPE: "WORK" }];
-    }
-
-    console.log("LeadFields enviados:", JSON.stringify(leadFields, null, 2));
+    if (fullPhone) leadFields.PHONE = [{ VALUE: fullPhone, VALUE_TYPE: "WORK" }];
+    if (emailNorm) leadFields.EMAIL = [{ VALUE: emailNorm, VALUE_TYPE: "WORK" }];
 
     const leadId = await bitrixCall("crm.lead.add", { fields: leadFields });
 
-    // ✅ GARANTE o comentário na TIMELINE
-    await addTimelineCommentToLead(leadId, timelineText);
+    // ✅ Garantir timeline também
+    await addTimelineCommentToLead(leadId, commentText);
 
     return res.json({
       status: "LEAD_CREATED",
       leadId,
+      commentFieldKey,
     });
   } catch (err) {
     console.error("ERRO GERAL /api/dfimoveis:", err);
-
     return res.status(500).json({
       error: "INTERNAL_ERROR",
       message: err.message,
