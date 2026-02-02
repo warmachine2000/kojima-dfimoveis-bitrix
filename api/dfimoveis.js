@@ -56,7 +56,7 @@ async function bitrixCall(method, params) {
     throw new Error("BITRIX_WEBHOOK_URL não definido nas variáveis de ambiente");
   }
 
-  // ✅ Bitrix REST exige .json
+  // ✅ Bitrix REST exige .json no final
   const url = `${BITRIX_WEBHOOK_URL}/${method}.json`;
 
   const resp = await fetch(url, {
@@ -138,18 +138,18 @@ module.exports = async (req, res) => {
     console.log("=== INÍCIO /api/dfimoveis ===");
     console.log("Method:", req.method);
 
-    // ✅ Aceita POST e GET (portais às vezes enviam GET)
-    if (req.method !== "POST" && req.method !== "GET") {
-      return res.status(405).json({ error: "Method not allowed" });
-    }
-
-    // ✅ CORS básico (se algum portal/browser reclamar)
+    // ✅ CORS básico
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
 
     if (req.method === "OPTIONS") {
       return res.status(200).end();
+    }
+
+    // ✅ Aceita POST e GET (portais às vezes enviam GET)
+    if (req.method !== "POST" && req.method !== "GET") {
+      return res.status(405).json({ error: "Method not allowed" });
     }
 
     // Autenticação via Authorization: Bearer <token>
@@ -289,7 +289,7 @@ module.exports = async (req, res) => {
         `originLeadId: ${originLeadId || ""}\n` +
         `timestamp: ${timestamp || ""}`,
 
-      // ⚠️ AJUSTE ESTES CÓDIGOS DE CAMPOS PERSONALIZADOS
+      // ⚠️ Ajuste se os códigos de UF forem diferentes no seu Bitrix
       UF_CODIGO_IMOVEL: codigoImovel,
       UF_PORTAL_ORIGEM: portalOrigemUF,
       UF_DFIMOVEIS_ORIGIN_LEAD_ID: originLeadId || "",
