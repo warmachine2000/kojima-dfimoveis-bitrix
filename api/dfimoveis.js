@@ -1,244 +1,191 @@
 /**
- * Integração DF Imóveis / 62 Imóveis  → Bitrix24
+ * DF Imóveis -> Bitrix24 (Webhook)
  * Autor: Adriano Alves
- * Projeto: kojima-dfimoveis-bitrix
+ *
+ * ✅ Correções incluídas:
+ * - mode=fields roda ANTES de validar name/email/phone
+ * - Remove uso de crm.activity.add (evita erro COMMUNICATIONS)
+ * - Cria/atualiza Lead + grava texto no campo COMMENTS (campo do Lead)
+ * - Opcional: também cria comentário na TIMELINE (crm.timeline.comment.add)
+ * - Anti-duplicação simples: procura lead por telefone/e-mail e atualiza se achar
+ *
+ * ENV:
+ * - BITRIX_WEBHOOK_URL = https://SEU.bitrix24.com.br/rest/1/SEU_WEBHOOK
  */
 
 const BITRIX_WEBHOOK_URL = process.env.BITRIX_WEBHOOK_URL;
 
-// Fonte DF Imóveis (ID interno da fonte que você renomeou de "E-mail")
-const SOURCE_DF_IMOVEIS = "EMAIL";
-const SOURCE_62_IMOVEIS = "EMAIL";
-
-// Cache em memória (Vercel reaproveita em warm starts)
-let CACHED_LEAD_FIELDS = null;
-let CACHED_COMMENT_FIELD_KEY = null;
-
-// ---------------- Helpers ----------------
-
-function safeStr(v) {
-  return v === undefined || v === null ? "" : String(v);
+function onlyDigits(str = "") {
+  return String(str).replace(/\D+/g, "");
 }
 
-function normalizePhone(ddd, phone) {
-  const digitsDDD = (ddd || "").toString().replace(/\D/g, "");
-  const digitsPhone = (phone || "").toString().replace(/\D/g, "");
-  if (!digitsPhone) return null;
-  if (digitsDDD) return `+55${digitsDDD}${digitsPhone}`;
-  return `+55${digitsPhone}`;
+function normalizePhoneBR(phoneRaw = "") {
+  // Aceita: 61999998888, +55 61 99999-8888, 61 99999-8888 etc.
+  const d = onlyDigits(phoneRaw);
+  if (!d) return "";
+
+  // Se vier com 55 na frente
+  if (d.length >= 12 && d.startsWith("55")) return `+${d}`;
+
+  // Se vier DDD+numero sem 55
+  if (d.length === 10 || d.length === 11) return `+55${d}`;
+
+  // Se vier maior/menor, retorna como +digits (pra não quebrar)
+  return d.startsWith("+") ? d : `+${d}`;
 }
 
-function normalizeEmail(email) {
-  const e = (email || "").toString().trim().toLowerCase();
-  return e || null;
+function nowISO() {
+  return new Date().toISOString();
 }
 
-function stripAccents(s) {
-  return (s || "")
-    .toString()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "");
-}
-
-function buildListingUrl(listingUrl, originListingId, clientListingId) {
-  if (listingUrl) return String(listingUrl);
-  const code = clientListingId || originListingId;
-  if (code) return `https://www.dfimoveis.com.br/imovel/${encodeURIComponent(code)}`;
-  return "";
-}
-
-function buildTimelineMessage({
-  portalNome,
-  leadOrigin,
-  codigoImovel,
-  listingUrl,
-  name,
-  fullPhone,
-  email,
-  message,
-  clientListingId,
-  originListingId,
-  originLeadId,
-  timestamp,
-}) {
-  const urlLine = listingUrl ? `🔗 Link do anúncio: ${listingUrl}\n` : "";
-
-  return (
-    `📩 *Novo contato - ${portalNome}*\n\n` +
-    `🏷 Código do anúncio: ${codigoImovel}\n` +
-    urlLine +
-    `👤 Nome: ${safeStr(name) || "Não informado"}\n` +
-    `📞 Telefone: ${fullPhone || "Não informado"}\n` +
-    `✉️ E-mail: ${email || "Não informado"}\n` +
-    `🧭 leadOrigin: ${leadOrigin || ""}\n\n` +
-    `📝 Mensagem:\n${safeStr(message) || "(vazia)"}\n\n` +
-    `-- Dados técnicos --\n` +
-    `clientListingId: ${safeStr(clientListingId)}\n` +
-    `originListingId: ${safeStr(originListingId)}\n` +
-    `originLeadId: ${safeStr(originLeadId)}\n` +
-    `timestamp: ${safeStr(timestamp)}\n`
-  );
-}
-
-async function bitrixCall(method, params) {
+async function bitrixCall(method, params = {}) {
   if (!BITRIX_WEBHOOK_URL) {
-    throw new Error("BITRIX_WEBHOOK_URL não definido nas variáveis de ambiente");
+    throw new Error("BITRIX_WEBHOOK_URL não definido");
   }
 
-  const url = `${BITRIX_WEBHOOK_URL}/${method}.json`;
+  const url = `${BITRIX_WEBHOOK_URL.replace(/\/+$/, "")}/${method}.json`;
 
   const resp = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(params || {}),
+    body: JSON.stringify(params),
   });
 
-  let data = {};
-  try {
-    data = await resp.json();
-  } catch (_) {
-    data = {};
-  }
+  const data = await resp.json().catch(() => ({}));
 
-  if (!resp.ok) {
-    console.error(`Bitrix request FAILED [${method}]`, resp.status, data);
-    throw new Error(
-      `BITRIX_REQUEST_FAILED (${resp.status}) [${method}] - ${JSON.stringify(data)}`
-    );
-  }
-
-  if (data && data.error) {
-    throw new Error(
-      `BITRIX_API_ERROR [${method}] ${data.error}: ${data.error_description || ""}`
-    );
+  if (!resp.ok || data.error) {
+    const errMsg =
+      data?.error_description ||
+      data?.error ||
+      `BITRIX_REQUEST_FAILED (${resp.status})`;
+    const e = new Error(errMsg);
+    e.status = resp.status;
+    e.data = data;
+    throw e;
   }
 
   return data.result;
 }
 
-/**
- * Descobre automaticamente qual campo do LEAD tem título "Comentário".
- * Isso resolve quando o seu layout mostra um UF_* chamado "Comentário".
- */
-async function resolveLeadCommentFieldKey() {
-  if (CACHED_COMMENT_FIELD_KEY) return CACHED_COMMENT_FIELD_KEY;
-
-  // Se já temos os fields em cache, usa
-  if (!CACHED_LEAD_FIELDS) {
-    CACHED_LEAD_FIELDS = await bitrixCall("crm.lead.fields", {});
-  }
-
-  // Tentativa 1: achar campo cujo title/FORM_LABEL seja "Comentário"
-  const target = "comentario";
-
-  for (const [key, def] of Object.entries(CACHED_LEAD_FIELDS || {})) {
-    const title = stripAccents(def?.title || "").toLowerCase().trim();
-    const formLabel = stripAccents(def?.formLabel || def?.form_label || "").toLowerCase().trim();
-    const listLabel = stripAccents(def?.listLabel || def?.list_label || "").toLowerCase().trim();
-
-    const joined = [title, formLabel, listLabel].filter(Boolean).join(" | ");
-
-    if (joined.includes(target)) {
-      // Preferir campos de texto
-      const type = (def?.type || "").toLowerCase();
-      if (type === "text" || type === "string") {
-        CACHED_COMMENT_FIELD_KEY = key;
-        return CACHED_COMMENT_FIELD_KEY;
-      }
-    }
-  }
-
-  // Tentativa 2: fallback seguro: COMMENTS (campo padrão)
-  CACHED_COMMENT_FIELD_KEY = "COMMENTS";
-  return CACHED_COMMENT_FIELD_KEY;
-}
-
-async function addTimelineCommentToLead(leadId, commentText) {
-  return bitrixCall("crm.timeline.comment.add", {
-    fields: {
-      ENTITY_TYPE: "lead",
-      ENTITY_ID: Number(leadId),
-      COMMENT: commentText,
-    },
-  });
-}
-
-async function findDuplicate(phone, email) {
-  const duplicates = { PHONE: null, EMAIL: null };
+async function findLeadByPhoneOrEmail({ phone, email }) {
+  // Busca simples por PHONE/EMAIL. Retorna o primeiro lead encontrado.
+  // Bitrix filtra assim: filter: { "PHONE": "+5561...", "EMAIL": "x@y.com" } (nem sempre funciona igual)
+  // Estratégia: tenta por PHONE, depois por EMAIL.
 
   if (phone) {
-    try {
-      duplicates.PHONE = await bitrixCall("crm.duplicate.findbycomm", {
-        type: "PHONE",
-        values: [phone],
-      });
-    } catch (e) {
-      console.warn("Erro duplicidade telefone:", e.message);
-    }
+    const list = await bitrixCall("crm.lead.list", {
+      filter: { PHONE: phone },
+      select: ["ID", "TITLE", "NAME", "PHONE", "EMAIL"],
+      order: { ID: "DESC" },
+    });
+    if (Array.isArray(list) && list.length) return list[0];
   }
 
   if (email) {
-    try {
-      duplicates.EMAIL = await bitrixCall("crm.duplicate.findbycomm", {
-        type: "EMAIL",
-        values: [email],
-      });
-    } catch (e) {
-      console.warn("Erro duplicidade email:", e.message);
-    }
+    const list = await bitrixCall("crm.lead.list", {
+      filter: { EMAIL: email },
+      select: ["ID", "TITLE", "NAME", "PHONE", "EMAIL"],
+      order: { ID: "DESC" },
+    });
+    if (Array.isArray(list) && list.length) return list[0];
   }
 
-  return duplicates;
+  return null;
 }
 
-function pickLeadIdFromDuplicates(duplicates) {
-  const leadFromPhone = duplicates?.PHONE?.LEAD?.[0];
-  const leadFromEmail = duplicates?.EMAIL?.LEAD?.[0];
-  return leadFromPhone || leadFromEmail || null;
+function buildDfImoveisTitle({ portal = "DF Imóveis", listingCode = "NAO_INFORMADO", name = "Sem Nome" }) {
+  return `${portal} | ${listingCode || "NAO_INFORMADO"} | ${name || "Sem Nome"}`;
 }
 
-// ---------------- Handler ----------------
+function buildDfImoveisComment({
+  portal = "DF Imóveis",
+  listingCode = "NAO_INFORMADO",
+  listingUrl = "",
+  name = "",
+  phone = "",
+  email = "",
+  leadOrigin = "dfimoveis",
+  message = "",
+  clientListingId = "",
+  originListingId = "",
+  originLeadId = "",
+  timestamp = "",
+}) {
+  const lines = [];
+
+  lines.push(`*Novo contato - ${portal}*`);
+  lines.push("");
+  lines.push(`🏷 Código do anúncio: ${listingCode || "NAO_INFORMADO"}`);
+
+  if (listingUrl) lines.push(`🔗 Link do anúncio: ${listingUrl}`);
+
+  if (name) lines.push(`👤 Nome: ${name}`);
+  if (phone) lines.push(`📞 Telefone: ${phone}`);
+  if (email) lines.push(`✉️ E-mail: ${email}`);
+
+  lines.push(`🧭 leadOrigin: ${leadOrigin}`);
+
+  lines.push("");
+  lines.push("📝 Mensagem:");
+  lines.push(message ? String(message) : "(sem mensagem)");
+
+  lines.push("");
+  lines.push("-- Dados técnicos --");
+  if (clientListingId) lines.push(`clientListingId: ${clientListingId}`);
+  if (originListingId) lines.push(`originListingId: ${originListingId}`);
+  if (originLeadId) lines.push(`originLeadId: ${originLeadId}`);
+  if (timestamp) lines.push(`timestamp: ${timestamp}`);
+
+  return lines.join("\n");
+}
 
 module.exports = async (req, res) => {
   try {
-    // CORS básico
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
-
-    if (req.method === "OPTIONS") return res.status(200).end();
-    if (req.method !== "POST" && req.method !== "GET") {
-      return res.status(405).json({ error: "Method not allowed" });
+    // =========================
+    // ✅ 0) MODO "FIELDS" PRIMEIRO (antes de validar identidade)
+    // =========================
+    if (req.method === "GET" && (req.query?.mode === "fields" || req.query?.mode === "field")) {
+      const fields = await bitrixCall("crm.lead.fields", {});
+      return res.status(200).json({ ok: true, fields });
     }
 
-    // Payload
-    let payload = {};
-    if (req.method === "GET") {
-      payload = req.query || {};
-    } else {
-      if (!req.body) {
-        payload = req.query || {};
-      } else if (typeof req.body === "string") {
-        payload = JSON.parse(req.body);
-      } else {
-        payload = req.body;
-      }
-    }
+    // =========================
+    // ✅ 1) Aceita GET (querystring) e POST (body)
+    // =========================
+    const payload =
+      req.method === "POST"
+        ? (typeof req.body === "string" ? JSON.parse(req.body) : req.body || {})
+        : (req.query || {});
 
-    const {
-      clientListingId,
-      name,
-      email,
-      ddd,
-      phone,
-      message,
-      leadOrigin,
-      timestamp,
-      originLeadId,
-      originListingId,
-      listingUrl,
-    } = payload;
+    // Campos esperados (adaptáveis)
+    const portal = payload.portal || "DF Imóveis";
+    const leadOrigin = payload.leadOrigin || "dfimoveis";
 
+    const name = payload.name || payload.nome || "";
+    const email = payload.email || payload["e-mail"] || "";
+    const phoneRaw = payload.phone || payload.telefone || payload.whatsapp || "";
+    const phone = normalizePhoneBR(phoneRaw);
+
+    const listingUrl = payload.listingUrl || payload.url || payload.imovelUrl || "";
+    const listingCode =
+      payload.listingCode ||
+      payload.codigoAnuncio ||
+      payload.codAnuncio ||
+      payload.adCode ||
+      payload.imovelCodigo ||
+      "NAO_INFORMADO";
+
+    const message = payload.message || payload.mensagem || "";
+
+    // IDs técnicos (se o DF Imóveis mandar)
+    const clientListingId = payload.clientListingId || payload.client_listing_id || "";
+    const originListingId = payload.originListingId || payload.origin_listing_id || "";
+    const originLeadId = payload.originLeadId || payload.origin_lead_id || "";
+    const timestamp = payload.timestamp || payload.ts || "";
+
+    // =========================
+    // ✅ 2) Validação mínima
+    // =========================
     if (!name && !email && !phone) {
       return res.status(400).json({
         error: "MISSING_IDENTITY",
@@ -246,105 +193,108 @@ module.exports = async (req, res) => {
       });
     }
 
-    const originLower = (leadOrigin || "").toString().toLowerCase();
-    const is62Imoveis = originLower === "62imoveis";
-
-    let portalNome = "DF Imóveis";
-    let sourceId = SOURCE_DF_IMOVEIS;
-    let portalOrigemUF = "DF_IMOVEIS";
-
-    if (is62Imoveis) {
-      portalNome = "62 Imóveis";
-      sourceId = SOURCE_62_IMOVEIS;
-      portalOrigemUF = "62_IMOVEIS";
-    }
-
-    const fullPhone = normalizePhone(ddd, phone);
-    const emailNorm = normalizeEmail(email);
-
-    const codigoImovel = clientListingId || originListingId || "NAO_INFORMADO";
-    const anuncioUrl = buildListingUrl(listingUrl, originListingId, clientListingId);
-
-    const commentText = buildTimelineMessage({
-      portalNome,
-      leadOrigin,
-      codigoImovel,
-      listingUrl: anuncioUrl,
+    // =========================
+    // ✅ 3) Monta TITLE + COMMENTS (campo certo do Lead)
+    // =========================
+    const title = buildDfImoveisTitle({ portal, listingCode, name });
+    const commentText = buildDfImoveisComment({
+      portal,
+      listingCode,
+      listingUrl,
       name,
-      fullPhone,
-      email: emailNorm,
+      phone,
+      email,
+      leadOrigin,
       message,
       clientListingId,
       originListingId,
       originLeadId,
-      timestamp,
+      timestamp: timestamp || nowISO(),
     });
 
-    // Descobre campo real "Comentário" do seu layout
-    const commentFieldKey = await resolveLeadCommentFieldKey();
+    // =========================
+    // ✅ 4) Anti-duplicação: procura lead por phone/email
+    // =========================
+    let existing = null;
+    try {
+      existing = await findLeadByPhoneOrEmail({ phone, email });
+    } catch (e) {
+      // Se a busca falhar, não mata o fluxo (só cria novo)
+      console.warn("findLeadByPhoneOrEmail failed:", e?.message);
+    }
 
-    // Duplicidade
-    const duplicates = await findDuplicate(fullPhone, emailNorm);
-    const duplicatedLeadId = pickLeadIdFromDuplicates(duplicates);
+    const leadFields = {
+      TITLE: title,
+      NAME: name || undefined,
 
-    if (duplicatedLeadId) {
-      // ✅ 1) Timeline
-      await addTimelineCommentToLead(duplicatedLeadId, commentText);
+      // Campo certo (comentário do Lead)
+      COMMENTS: commentText,
 
-      // ✅ 2) Campo do formulário (o que você chamou de "campo correto")
-      // atualiza o lead duplicado com o comentário também
+      // Fonte (opcional)
+      SOURCE_DESCRIPTION: `${portal} (${leadOrigin})`,
+
+      // Comunicação
+      PHONE: phone ? [{ VALUE: phone, VALUE_TYPE: "WORK" }] : undefined,
+      EMAIL: email ? [{ VALUE: email, VALUE_TYPE: "WORK" }] : undefined,
+    };
+
+    // Remove undefined (Bitrix às vezes reclama)
+    Object.keys(leadFields).forEach((k) => leadFields[k] === undefined && delete leadFields[k]);
+
+    let leadId = null;
+    let status = "";
+
+    if (existing?.ID) {
+      // Atualiza para não duplicar
       await bitrixCall("crm.lead.update", {
-        id: Number(duplicatedLeadId),
+        id: existing.ID,
+        fields: leadFields,
+        params: { REGISTER_SONET_EVENT: "Y" },
+      });
+      leadId = Number(existing.ID);
+      status = "LEAD_UPDATED";
+    } else {
+      leadId = await bitrixCall("crm.lead.add", {
+        fields: leadFields,
+        params: { REGISTER_SONET_EVENT: "Y" },
+      });
+      leadId = Number(leadId);
+      status = "LEAD_CREATED";
+    }
+
+    // =========================
+    // ✅ 5) (Opcional) Comentário na TIMELINE
+    // =========================
+    // Se você NÃO quiser timeline, comente esse bloco inteiro.
+    try {
+      await bitrixCall("crm.timeline.comment.add", {
         fields: {
-          [commentFieldKey]: commentText,
-          COMMENTS: commentText, // mantém também o padrão
+          ENTITY_TYPE: "lead",
+          ENTITY_ID: leadId,
+          COMMENT: commentText,
         },
       });
+    } catch (e) {
+      // Se falhar, não quebra o lead
+      console.warn("timeline.comment.add failed:", e?.message);
+    }
 
-      return res.json({
-        status: "DUPLICATE_UPDATED_WITH_COMMENT",
-        leadId: duplicatedLeadId,
-        commentFieldKey,
+    return res.status(200).json({ status, leadId });
+  } catch (err) {
+    console.error(err);
+
+    // Erro do Bitrix com mais detalhes
+    if (err?.message?.includes("BITRIX_REQUEST_FAILED") || err?.data) {
+      return res.status(500).json({
+        error: "INTERNAL_ERROR",
+        message: err.message,
+        bitrix: err.data || null,
       });
     }
 
-    // Novo Lead
-    const leadFields = {
-      TITLE: `${portalNome} | ${codigoImovel} | ${name || "Sem nome"}`,
-      NAME: name || "Contato Portal",
-      SOURCE_ID: sourceId,
-      SOURCE_DESCRIPTION: `Lead vindo do portal ${portalNome}`,
-
-      // ✅ Preenche os dois: campo padrão + campo do seu layout
-      COMMENTS: commentText,
-      [commentFieldKey]: commentText,
-
-      // ⚠️ Esses UF_* só mantenha se existirem no seu Bitrix.
-      // Se não existirem, comente essas linhas.
-      UF_CODIGO_IMOVEL: codigoImovel,
-      UF_PORTAL_ORIGEM: portalOrigemUF,
-      UF_DFIMOVEIS_ORIGIN_LEAD_ID: originLeadId || "",
-      UF_DFIMOVEIS_ORIGIN_LISTING_ID: originListingId || "",
-    };
-
-    if (fullPhone) leadFields.PHONE = [{ VALUE: fullPhone, VALUE_TYPE: "WORK" }];
-    if (emailNorm) leadFields.EMAIL = [{ VALUE: emailNorm, VALUE_TYPE: "WORK" }];
-
-    const leadId = await bitrixCall("crm.lead.add", { fields: leadFields });
-
-    // ✅ Garantir timeline também
-    await addTimelineCommentToLead(leadId, commentText);
-
-    return res.json({
-      status: "LEAD_CREATED",
-      leadId,
-      commentFieldKey,
-    });
-  } catch (err) {
-    console.error("ERRO GERAL /api/dfimoveis:", err);
     return res.status(500).json({
       error: "INTERNAL_ERROR",
-      message: err.message,
+      message: err.message || "Erro inesperado",
     });
   }
 };
