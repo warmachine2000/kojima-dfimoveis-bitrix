@@ -1,45 +1,109 @@
-// pages/api/dfimoveis.js
-// Node 18+ (Vercel) - usa fetch nativo
+// api/dfimoveis.js
+// Endpoint DF Imóveis / 62 Imóveis -> Bitrix
+// Suporta:
+//  - POST (application/json) conforme VRSYNC
+//  - GET (querystring) para testes manuais
 
-const BITRIX_WEBHOOK_URL = process.env.BITRIX_WEBHOOK_URL;
-
-// Campo custom que você mostrou no fields:
-// listLabel/formLabel: "UF_CRM_ORIGIN_URL"
-const UF_CRM_ORIGIN_URL_FIELD = "UF_CRM_1763320747675";
-
-// Nome desejado da fonte (como aparece no Bitrix)
-const DEFAULT_SOURCE_NAME = "Portal DF Imóveis";
-
-// ----------------------------------------------------
-
-function mustEnv(name) {
-  if (!process.env[name]) throw new Error(`Missing env: ${name}`);
-  return process.env[name];
+function onlyDigits(str = "") {
+  return String(str).replace(/\D+/g, "");
 }
 
-function cleanPhone(phone) {
-  if (!phone) return "";
-  // mantém + e números
-  const p = String(phone).trim();
-  // se vier sem +, ok, Bitrix aceita, mas vamos padronizar
-  return p.startsWith("+") ? p : p;
+function normalizePhoneBR(raw = "") {
+  const digits = onlyDigits(raw);
+  if (!digits) return { e164: "", digits: "" };
+
+  // Se vier com 55 na frente, remove para validar DDD+numero
+  let d = digits;
+  if (d.startsWith("55") && d.length >= 12) d = d.slice(2);
+
+  // Esperado: DDD(2) + número (8 ou 9)
+  // Se vier curto, retorna o que tiver
+  const e164 = d ? `+55${d}` : "";
+  return { e164, digits: d };
 }
 
-function asOneLine(str) {
-  return String(str || "").replace(/\s+/g, " ").trim();
+function safeStr(v) {
+  if (v === null || v === undefined) return "";
+  return String(v).trim();
 }
 
-function toMultifield(value, type = "WORK") {
-  const v = String(value || "").trim();
-  if (!v) return undefined;
-  return [{ VALUE: v, VALUE_TYPE: type }];
+// Extrai um “código do anúncio” a partir de vários possíveis campos
+function resolveListingCode(input = {}) {
+  const direct =
+    safeStr(input.listingCode) ||
+    safeStr(input.ListingCode) ||
+    safeStr(input.ClientListingId) ||
+    safeStr(input.clientListingId);
+
+  if (direct) return direct;
+
+  // tenta extrair de URL /imovel/DF321999
+  const url = safeStr(input.listingUrl) || safeStr(input.ListingUrl);
+  const m = url.match(/\/imovel\/([^/?#]+)/i);
+  return m ? m[1] : "NAO_INFORMADO";
 }
 
-async function bitrixCall(method, params = {}) {
-  mustEnv("BITRIX_WEBHOOK_URL");
+function resolveListingUrl(input = {}) {
+  const direct = safeStr(input.listingUrl) || safeStr(input.ListingUrl) || safeStr(input.listingURL);
+  if (direct) return direct;
 
-  // Bitrix aceita GET ou POST. Vamos usar POST com JSON para evitar limite de querystring.
-  const url = `${BITRIX_WEBHOOK_URL.replace(/\/$/, "")}/${method}.json`;
+  const code = resolveListingCode(input);
+  if (code && code !== "NAO_INFORMADO") return `https://www.dfimoveis.com.br/imovel/${code}`;
+  return "";
+}
+
+function buildComments(payload = {}) {
+  const leadOrigin = safeStr(payload.leadOrigin || payload.LeadOrigin || "dfimoveis");
+
+  const timestamp =
+    safeStr(payload.timestamp || payload.Timestamp) ||
+    new Date().toISOString();
+
+  const originLeadId = safeStr(payload.originLeadId || payload.OriginLeadId);
+  const originListingId = safeStr(payload.originListingId || payload.OriginListingId);
+
+  const name = safeStr(payload.name || payload.Name);
+  const email = safeStr(payload.email || payload.Email);
+  const phoneRaw = safeStr(payload.phone || payload.Phone || payload.PhoneNumber);
+  const { e164 } = normalizePhoneBR(phoneRaw);
+
+  const listingCode = resolveListingCode(payload);
+  const listingUrl = resolveListingUrl(payload);
+
+  const msg = safeStr(payload.message || payload.Message);
+
+  // Texto puro (Bitrix COMMENTS interpreta bem \n)
+  const lines = [];
+
+  lines.push(`*Novo contato - DF Imóveis*`);
+  lines.push(``);
+  lines.push(`Código do anúncio: ${listingCode}`);
+  if (listingUrl) lines.push(`Link do anúncio: ${listingUrl}`);
+  if (name) lines.push(`Nome: ${name}`);
+  if (e164) lines.push(`Telefone: ${e164}`);
+  if (email) lines.push(`E-mail: ${email}`);
+  lines.push(`leadOrigin: ${leadOrigin}`);
+  lines.push(``);
+
+  lines.push(`Mensagem:`);
+  lines.push(msg || "(sem mensagem)");
+  lines.push(``);
+
+  lines.push(`-- Dados técnicos --`);
+  lines.push(`timestamp: ${timestamp}`);
+  if (originLeadId) lines.push(`originLeadId: ${originLeadId}`);
+  if (originListingId) lines.push(`originListingId: ${originListingId}`);
+
+  return lines.join("\n");
+}
+
+async function callBitrix(method, params) {
+  const base = process.env.BITRIX_WEBHOOK_BASE_URL; // ex: https://SEU.bitrix24.com.br/rest/1/xxxxxxxxx
+  if (!base) {
+    throw new Error("MISSING_ENV: BITRIX_WEBHOOK_BASE_URL");
+  }
+
+  const url = `${base}/${method}.json`;
 
   const resp = await fetch(url, {
     method: "POST",
@@ -49,261 +113,153 @@ async function bitrixCall(method, params = {}) {
 
   const data = await resp.json().catch(() => ({}));
 
-  // Bitrix costuma retornar { result, error, error_description }
   if (!resp.ok || data.error) {
     const msg = data.error_description || data.error || `HTTP_${resp.status}`;
-    const err = new Error(msg);
+    const err = new Error(`BITRIX_REQUEST_FAILED (${resp.status}) ${method} - ${msg}`);
     err.bitrix = data;
-    err.httpStatus = resp.status;
     throw err;
   }
 
-  return data.result;
+  return data;
 }
 
-async function getSources() {
-  // Lista fontes: crm.status.list com ENTITY_ID=SOURCE
-  const result = await bitrixCall("crm.status.list", {
-    filter: { ENTITY_ID: "SOURCE" },
-  });
+function parseIncoming(req) {
+  // 1) POST JSON (VRSYNC)
+  // 2) GET querystring (teste manual)
+  if (req.method === "POST") return req.body || {};
 
-  // result é array com { ID, ENTITY_ID, STATUS_ID, NAME, ... }
-  return Array.isArray(result) ? result : [];
+  // GET
+  const q = req.query || {};
+  return {
+    leadOrigin: q.leadOrigin,
+    timestamp: q.timestamp,
+    originLeadId: q.originLeadId,
+    name: q.name,
+    email: q.email,
+    phone: q.phone,
+    clientListingId: q.clientListingId,
+    originListingId: q.originListingId,
+    listingCode: q.listingCode,
+    listingUrl: q.listingUrl,
+    message: q.message,
+  };
 }
 
-function buildComments({
-  listingCode,
-  listingUrl,
-  name,
-  phone,
-  email,
-  leadOrigin,
-  message,
-  technical = {},
-}) {
-  const lines = [];
+function validateIdentity(p = {}) {
+  const name = safeStr(p.name || p.Name);
+  const email = safeStr(p.email || p.Email);
+  const phone = safeStr(p.phone || p.Phone || p.PhoneNumber);
 
-  lines.push("*Novo contato - DF Imóveis*");
-  lines.push("");
-
-  if (listingCode) lines.push(`Código do anúncio: ${listingCode}`);
-  if (listingUrl) lines.push(`Link do anúncio: ${listingUrl}`);
-
-  if (name) lines.push(`Nome: ${name}`);
-  if (phone) lines.push(`Telefone: ${phone}`);
-  if (email) lines.push(`E-mail: ${email}`);
-
-  if (leadOrigin) lines.push(`leadOrigin: ${leadOrigin}`);
-
-  if (message) {
-    lines.push("");
-    lines.push("Mensagem:");
-    lines.push(String(message));
+  if (!name && !email && !phone) {
+    const err = new Error("MISSING_IDENTITY");
+    err.statusCode = 400;
+    err.publicMessage = "Precisa de ao menos nome, e-mail ou telefone";
+    throw err;
   }
-
-  // dados técnicos (se vier)
-  const techKeys = Object.keys(technical || {});
-  if (techKeys.length) {
-    lines.push("");
-    lines.push("-- Dados técnicos --");
-    for (const k of techKeys) {
-      const v = technical[k];
-      if (v !== undefined && v !== null && String(v).trim() !== "") {
-        lines.push(`${k}: ${v}`);
-      }
-    }
-  }
-
-  return lines.join("\n");
 }
-
-function textToHtml(text) {
-  // timeline comment normalmente aceita HTML
-  return String(text || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/\n/g, "<br>");
-}
-
-// ----------------------------------------------------
 
 export default async function handler(req, res) {
   try {
-    if (req.method !== "GET") {
-      return res.status(405).json({ error: "METHOD_NOT_ALLOWED" });
+    // Healthcheck simples
+    if (req.method === "GET" && req.query && req.query.ping === "1") {
+      return res.status(200).json({ ok: true, pong: true });
     }
 
-    if (!BITRIX_WEBHOOK_URL) {
-      return res.status(500).json({ error: "MISSING_ENV", message: "BITRIX_WEBHOOK_URL não configurado" });
-    }
+    const incoming = parseIncoming(req);
 
-    const mode = String(req.query.mode || "").trim().toLowerCase();
-
-    // MODE = fields: devolve fields + sources (para você achar o SOURCE_ID certo)
-    if (mode === "fields") {
-      const fields = await bitrixCall("crm.lead.fields", {});
-      const sources = await getSources();
-
+    // Modo “ajuda” para vocês (retorna exemplo do payload que o DF deve mandar)
+    if (req.method === "GET" && req.query && req.query.mode === "sample") {
       return res.status(200).json({
         ok: true,
-        fields,
-        sources: sources.map(s => ({
-          STATUS_ID: s.STATUS_ID,
-          NAME: s.NAME,
-        })),
-        hint: "Use o STATUS_ID correspondente ao NAME='Portal DF Imóveis' no campo SOURCE_ID.",
-      });
-    }
-
-    // ---------- Entrada padrão ----------
-    const name = asOneLine(req.query.name);
-    const phone = cleanPhone(req.query.phone);
-    const email = asOneLine(req.query.email);
-    const leadOrigin = asOneLine(req.query.leadOrigin || "dfimoveis");
-
-    // Identidade mínima
-    if (!name && !phone && !email) {
-      return res.status(400).json({
-        error: "MISSING_IDENTITY",
-        message: "Precisa de ao menos nome, e-mail ou telefone",
-      });
-    }
-
-    const listingCode = asOneLine(req.query.listingCode || req.query.ddd || req.query.codigo || "");
-    const listingUrl = asOneLine(req.query.listingUrl || req.query.url || "");
-    const message = String(req.query.message || "").trim();
-
-    // Você pode forçar o SOURCE_ID via query: &sourceId=XXXX
-    let sourceId = asOneLine(req.query.sourceId || "");
-
-    // Se não vier sourceId, tenta resolver automaticamente pelo nome "Portal DF Imóveis"
-    if (!sourceId) {
-      const sources = await getSources();
-      const found = sources.find(s => String(s.NAME || "").trim().toLowerCase() === DEFAULT_SOURCE_NAME.toLowerCase());
-      if (found?.STATUS_ID) sourceId = found.STATUS_ID;
-    }
-
-    // ORIGINATOR/ORIGIN_ID para dedupe
-    const originLeadId = asOneLine(req.query.originLeadId || "");
-    const originId =
-      originLeadId ||
-      `dfimoveis:${listingCode || "NAO_INFORMADO"}:${(phone || email || name || "anon").replace(/\s+/g, "").slice(0, 60)}`;
-
-    // 1) tenta localizar lead existente pelo ORIGIN_ID/ORIGINATOR_ID
-    const existing = await bitrixCall("crm.lead.list", {
-      filter: {
-        ORIGINATOR_ID: "dfimoveis",
-        ORIGIN_ID: originId,
-      },
-      select: ["ID", "TITLE"],
-      order: { ID: "DESC" },
-      start: 0,
-    });
-
-    const codeForTitle = listingCode || "NAO_INFORMADO";
-    const title = `DF Imóveis | ${codeForTitle} | ${name || "Novo Lead"}`;
-
-    const technical = {
-      timestamp: new Date().toISOString(),
-      clientListingId: listingCode || "",
-      originListingId: "",
-      originLeadId: originLeadId || "",
-    };
-
-    const commentsPlain = buildComments({
-      listingCode: codeForTitle ? `DF${codeForTitle.replace(/^DF/i, "")}`.startsWith("DF") ? `DF${codeForTitle.replace(/^DF/i, "")}` : codeForTitle : codeForTitle,
-      listingUrl,
-      name,
-      phone,
-      email,
-      leadOrigin,
-      message,
-      technical,
-    });
-
-    let leadId;
-
-    if (Array.isArray(existing) && existing.length > 0) {
-      // atualiza lead existente
-      leadId = existing[0].ID;
-
-      const updateFields = {
-        TITLE: title,
-        COMMENTS: commentsPlain,
-        SOURCE_DESCRIPTION: leadOrigin,
-      };
-
-      if (sourceId) updateFields.SOURCE_ID = sourceId;
-      if (listingUrl) updateFields[UF_CRM_ORIGIN_URL_FIELD] = listingUrl;
-
-      if (phone) updateFields.PHONE = toMultifield(phone);
-      if (email) updateFields.EMAIL = toMultifield(email);
-
-      await bitrixCall("crm.lead.update", {
-        id: leadId,
-        fields: updateFields,
-      });
-
-      // timeline comment (opcional)
-      await bitrixCall("crm.timeline.comment.add", {
-        fields: {
-          ENTITY_TYPE_ID: 1, // Lead
-          ENTITY_ID: leadId,
-          COMMENT: textToHtml(commentsPlain),
+        expected: {
+          LeadOrigin: "DFimoveis",
+          Timestamp: new Date().toISOString(),
+          OriginLeadId: "uuid",
+          Name: "Teste",
+          Email: "teste@gmail.com",
+          Phone: "(61) 99999-9999",
+          PhoneNumber: "(61) 99999-9999",
+          ClientListingId: "VILLA152067V01",
+          OriginListingId: 1227330,
+          Message: "teste",
         },
       });
-
-      return res.status(200).json({
-        ok: true,
-        status: "LEAD_UPDATED",
-        leadId,
-        originId,
-        sourceId: sourceId || null,
-      });
     }
 
-    // cria lead novo
+    validateIdentity(incoming);
+
+    // Normaliza dados
+    const name = safeStr(incoming.name || incoming.Name);
+    const email = safeStr(incoming.email || incoming.Email);
+
+    const phoneRaw = safeStr(incoming.phone || incoming.Phone || incoming.PhoneNumber);
+    const { e164 } = normalizePhoneBR(phoneRaw);
+
+    const leadOrigin = safeStr(incoming.leadOrigin || incoming.LeadOrigin || "dfimoveis");
+
+    const listingCode = resolveListingCode(incoming);
+    const listingUrl = resolveListingUrl(incoming);
+
+    // Fonte (SOURCE_ID) — **configure pra não cair em "Chamada"**
+    // Coloque no Vercel env: BITRIX_SOURCE_ID_DFIMOVEIS=DFIMOVEIS (ou o ID real do seu Bitrix)
+    const sourceId = process.env.BITRIX_SOURCE_ID_DFIMOVEIS || undefined;
+
+    // Campo custom URL de origem (UF_CRM_ORIGIN_URL)
+    // Coloque no Vercel env: BITRIX_FIELD_ORIGIN_URL=UF_CRM_1763320747675 (se for o seu)
+    const originUrlField = process.env.BITRIX_FIELD_ORIGIN_URL || "";
+
+    const comments = buildComments({
+      ...incoming,
+      leadOrigin,
+      listingCode,
+      listingUrl,
+      name,
+      email,
+      phone: phoneRaw,
+    });
+
+    // Monta payload do Lead
     const leadFields = {
-      TITLE: title,
-      NAME: name || undefined,
-      COMMENTS: commentsPlain,              // ✅ campo Observação (o que você queria)
-      SOURCE_DESCRIPTION: leadOrigin,
-      ORIGINATOR_ID: "dfimoveis",
-      ORIGIN_ID: originId,
+      TITLE: `DF Imóveis | ${listingCode} | ${name || "Novo Lead"}`,
+      NAME: name || "",
+      COMMENTS: comments,
     };
 
-    if (sourceId) leadFields.SOURCE_ID = sourceId; // ✅ Fonte correta
-    if (phone) leadFields.PHONE = toMultifield(phone);
-    if (email) leadFields.EMAIL = toMultifield(email);
-    if (listingUrl) leadFields[UF_CRM_ORIGIN_URL_FIELD] = listingUrl; // ✅ URL no campo custom
+    // Só seta SOURCE_ID se tiver valor (evita erro se ID não existir)
+    if (sourceId) leadFields.SOURCE_ID = sourceId;
 
-    leadId = await bitrixCall("crm.lead.add", { fields: leadFields });
+    // Telefones/emails no formato Bitrix
+    if (e164) {
+      leadFields.PHONE = [{ VALUE: e164, VALUE_TYPE: "WORK" }];
+    }
+    if (email) {
+      leadFields.EMAIL = [{ VALUE: email, VALUE_TYPE: "WORK" }];
+    }
 
-    // timeline comment (opcional, mas útil)
-    await bitrixCall("crm.timeline.comment.add", {
-      fields: {
-        ENTITY_TYPE_ID: 1, // Lead
-        ENTITY_ID: leadId,
-        COMMENT: textToHtml(commentsPlain),
-      },
-    });
+    // UF_CRM_ORIGIN_URL (se configurado)
+    if (originUrlField && listingUrl) {
+      leadFields[originUrlField] = listingUrl;
+    }
+
+    // Cria Lead
+    const created = await callBitrix("crm.lead.add", { fields: leadFields });
+    const leadId = created?.result;
 
     return res.status(200).json({
-      ok: true,
       status: "LEAD_CREATED",
       leadId,
-      originId,
-      sourceId: sourceId || null,
+      listingCode,
+      leadOrigin,
+      receivedMethod: req.method,
     });
   } catch (err) {
-    const msg = err?.message || "INTERNAL_ERROR";
-    const bitrixErr = err?.bitrix || null;
+    const status = err.statusCode || 500;
 
-    return res.status(500).json({
-      error: "INTERNAL_ERROR",
-      message: msg,
-      bitrix: bitrixErr,
+    return res.status(status).json({
+      error: status === 500 ? "INTERNAL_ERROR" : "BAD_REQUEST",
+      message: err.publicMessage || err.message || "UNKNOWN_ERROR",
+      details: err.bitrix || undefined,
     });
   }
 }
+
