@@ -3,6 +3,13 @@
 // Suporta:
 //  - POST (application/json) conforme VRSYNC
 //  - GET (querystring) para testes manuais
+//
+// CORREÇÃO (DF Imóveis):
+// - NÃO montar URL pública usando ClientListingId (ex: VILLA...)
+//   pois /imovel/VILLA... pode dar 404.
+// - Priorizar URL que vier no payload (listingUrl / ListingUrl / listingURL).
+// - Se vier com "//" no path, normalizar.
+// - Se não vier URL, não inventar link (deixa vazio) e mantém IDs nos comentários.
 
 function onlyDigits(str = "") {
   return String(str).replace(/\D+/g, "");
@@ -27,6 +34,18 @@ function safeStr(v) {
   return String(v).trim();
 }
 
+function normalizeUrl(raw = "") {
+  let url = safeStr(raw);
+  if (!url) return "";
+
+  if (url.startsWith("www.")) url = "https://" + url;
+  if (!/^https?:\/\//i.test(url)) url = "https://" + url;
+
+  // remove double slash no path (mantendo https://)
+  url = url.replace(/([^:]\/)\/+/g, "$1");
+  return url;
+}
+
 // Extrai um “código do anúncio” a partir de vários possíveis campos
 function resolveListingCode(input = {}) {
   const direct =
@@ -38,18 +57,19 @@ function resolveListingCode(input = {}) {
   if (direct) return direct;
 
   // tenta extrair de URL /imovel/DF321999
-  const url = safeStr(input.listingUrl) || safeStr(input.ListingUrl);
+  const url = safeStr(input.listingUrl) || safeStr(input.ListingUrl) || safeStr(input.listingURL);
   const m = url.match(/\/imovel\/([^/?#]+)/i);
   return m ? m[1] : "NAO_INFORMADO";
 }
 
 function resolveListingUrl(input = {}) {
-  const direct = safeStr(input.listingUrl) || safeStr(input.ListingUrl) || safeStr(input.listingURL);
-  if (direct) return direct;
+  // DF Imóveis: só é confiável se vier pronto no payload
+  const direct =
+    safeStr(input.listingUrl) ||
+    safeStr(input.ListingUrl) ||
+    safeStr(input.listingURL);
 
-  const code = resolveListingCode(input);
-  if (code && code !== "NAO_INFORMADO") return `https://www.dfimoveis.com.br/imovel/${code}`;
-  return "";
+  return normalizeUrl(direct);
 }
 
 function buildComments(payload = {}) {
@@ -262,4 +282,3 @@ export default async function handler(req, res) {
     });
   }
 }
-
