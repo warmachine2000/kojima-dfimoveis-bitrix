@@ -4,12 +4,10 @@
 //  - POST (application/json) conforme VRSYNC
 //  - GET (querystring) para testes manuais
 //
-// CORREÇÃO (DF Imóveis):
-// - NÃO montar URL pública usando ClientListingId (ex: VILLA...)
-//   pois /imovel/VILLA... pode dar 404.
-// - Priorizar URL que vier no payload (listingUrl / ListingUrl / listingURL).
-// - Se vier com "//" no path, normalizar.
-// - Se não vier URL, não inventar link (deixa vazio) e mantém IDs nos comentários.
+// Regras DF Imóveis:
+// 1) Se vier listingUrl no payload, usar (normalizando).
+// 2) Se NÃO vier listingUrl, tentar gerar a partir de OriginListingId e resolver redirect para URL canônica.
+// 3) NÃO montar URL com ClientListingId (VILLA...) porque pode dar 404.
 
 function onlyDigits(str = "") {
   return String(str).replace(/\D+/g, "");
@@ -19,12 +17,9 @@ function normalizePhoneBR(raw = "") {
   const digits = onlyDigits(raw);
   if (!digits) return { e164: "", digits: "" };
 
-  // Se vier com 55 na frente, remove para validar DDD+numero
   let d = digits;
   if (d.startsWith("55") && d.length >= 12) d = d.slice(2);
 
-  // Esperado: DDD(2) + número (8 ou 9)
-  // Se vier curto, retorna o que tiver
   const e164 = d ? `+55${d}` : "";
   return { e164, digits: d };
 }
@@ -46,7 +41,7 @@ function normalizeUrl(raw = "") {
   return url;
 }
 
-// Extrai um “código do anúncio” a partir de vários possíveis campos
+// Extrai um “código do anúncio” (ClientListingId normalmente)
 function resolveListingCode(input = {}) {
   const direct =
     safeStr(input.listingCode) ||
@@ -56,14 +51,12 @@ function resolveListingCode(input = {}) {
 
   if (direct) return direct;
 
-  // tenta extrair de URL /imovel/DF321999
   const url = safeStr(input.listingUrl) || safeStr(input.ListingUrl) || safeStr(input.listingURL);
   const m = url.match(/\/imovel\/([^/?#]+)/i);
   return m ? m[1] : "NAO_INFORMADO";
 }
 
-function resolveListingUrl(input = {}) {
-  // DF Imóveis: só é confiável se vier pronto no payload
+function resolveListingUrlDirect(input = {}) {
   const direct =
     safeStr(input.listingUrl) ||
     safeStr(input.ListingUrl) ||
@@ -72,12 +65,64 @@ function resolveListingUrl(input = {}) {
   return normalizeUrl(direct);
 }
 
+function originListingIdFrom(input = {}) {
+  const v = input.originListingId ?? input.OriginListingId;
+  const s = safeStr(v);
+  // garante que é número (string numérica)
+  if (!s) return "";
+  if (!/^\d+$/.test(s)) return "";
+  return s;
+}
+
+// Tenta descobrir a URL canônica publicamente
+async function resolveDfCanonicalUrl({ directUrl, originListingId }) {
+  const direct = normalizeUrl(directUrl);
+  if (direct) return direct;
+
+  const id = safeStr(originListingId);
+  if (!id) return "";
+
+  // candidatos: alguns portais aceitam /imovel/{id} ou /imovel/imovel-{id} com redirect
+  const candidates = [
+    `https://www.dfimoveis.com.br/imovel/${id}`,
+    `https://www.dfimoveis.com.br/imovel/imovel-${id}`,
+  ];
+
+  for (const u of candidates) {
+    try {
+      // HEAD às vezes é bloqueado; se falhar, tenta GET leve
+      const resp = await fetch(u, {
+        method: "HEAD",
+        redirect: "follow",
+      });
+
+      // Alguns CDNs não retornam resp.url no HEAD; mas geralmente retorna.
+      if (resp && resp.ok && resp.url) {
+        const finalUrl = normalizeUrl(resp.url);
+        // se já vier canônica com -ID no final, melhor ainda
+        if (/-\d+\/?$/.test(finalUrl)) return finalUrl;
+        return finalUrl;
+      }
+
+      // fallback: tenta GET
+      const resp2 = await fetch(u, { method: "GET", redirect: "follow" });
+      if (resp2 && resp2.ok && resp2.url) {
+        const finalUrl2 = normalizeUrl(resp2.url);
+        if (/-\d+\/?$/.test(finalUrl2)) return finalUrl2;
+        return finalUrl2;
+      }
+    } catch {
+      // tenta próximo candidato
+    }
+  }
+
+  // Se não conseguiu resolver, devolve um candidato "funcional provável" (para o corretor tentar)
+  return candidates[0];
+}
+
 function buildComments(payload = {}) {
   const leadOrigin = safeStr(payload.leadOrigin || payload.LeadOrigin || "dfimoveis");
-
-  const timestamp =
-    safeStr(payload.timestamp || payload.Timestamp) ||
-    new Date().toISOString();
+  const timestamp = safeStr(payload.timestamp || payload.Timestamp) || new Date().toISOString();
 
   const originLeadId = safeStr(payload.originLeadId || payload.OriginLeadId);
   const originListingId = safeStr(payload.originListingId || payload.OriginListingId);
@@ -88,13 +133,11 @@ function buildComments(payload = {}) {
   const { e164 } = normalizePhoneBR(phoneRaw);
 
   const listingCode = resolveListingCode(payload);
-  const listingUrl = resolveListingUrl(payload);
+  const listingUrl = safeStr(payload._resolvedListingUrl || payload.listingUrl || payload.ListingUrl || payload.listingURL);
 
   const msg = safeStr(payload.message || payload.Message);
 
-  // Texto puro (Bitrix COMMENTS interpreta bem \n)
   const lines = [];
-
   lines.push(`*Novo contato - DF Imóveis*`);
   lines.push(``);
   lines.push(`Código do anúncio: ${listingCode}`);
@@ -118,10 +161,8 @@ function buildComments(payload = {}) {
 }
 
 async function callBitrix(method, params) {
-  const base = process.env.BITRIX_WEBHOOK_BASE_URL; // ex: https://SEU.bitrix24.com.br/rest/1/xxxxxxxxx
-  if (!base) {
-    throw new Error("MISSING_ENV: BITRIX_WEBHOOK_BASE_URL");
-  }
+  const base = process.env.BITRIX_WEBHOOK_BASE_URL;
+  if (!base) throw new Error("MISSING_ENV: BITRIX_WEBHOOK_BASE_URL");
 
   const url = `${base}/${method}.json`;
 
@@ -144,11 +185,8 @@ async function callBitrix(method, params) {
 }
 
 function parseIncoming(req) {
-  // 1) POST JSON (VRSYNC)
-  // 2) GET querystring (teste manual)
   if (req.method === "POST") return req.body || {};
 
-  // GET
   const q = req.query || {};
   return {
     leadOrigin: q.leadOrigin,
@@ -180,14 +218,12 @@ function validateIdentity(p = {}) {
 
 export default async function handler(req, res) {
   try {
-    // Healthcheck simples
     if (req.method === "GET" && req.query && req.query.ping === "1") {
       return res.status(200).json({ ok: true, pong: true });
     }
 
     const incoming = parseIncoming(req);
 
-    // Modo “ajuda” para vocês (retorna exemplo do payload que o DF deve mandar)
     if (req.method === "GET" && req.query && req.query.mode === "sample") {
       return res.status(200).json({
         ok: true,
@@ -208,7 +244,6 @@ export default async function handler(req, res) {
 
     validateIdentity(incoming);
 
-    // Normaliza dados
     const name = safeStr(incoming.name || incoming.Name);
     const email = safeStr(incoming.email || incoming.Email);
 
@@ -218,37 +253,35 @@ export default async function handler(req, res) {
     const leadOrigin = safeStr(incoming.leadOrigin || incoming.LeadOrigin || "dfimoveis");
 
     const listingCode = resolveListingCode(incoming);
-    const listingUrl = resolveListingUrl(incoming);
 
-    // Fonte (SOURCE_ID) — **configure pra não cair em "Chamada"**
-    // Coloque no Vercel env: BITRIX_SOURCE_ID_DFIMOVEIS=DFIMOVEIS (ou o ID real do seu Bitrix)
+    // >>> AQUI: resolve URL com fallback no OriginListingId
+    const originListingId = originListingIdFrom(incoming);
+    const listingUrl = await resolveDfCanonicalUrl({
+      directUrl: resolveListingUrlDirect(incoming),
+      originListingId,
+    });
+
     const sourceId = process.env.BITRIX_SOURCE_ID_DFIMOVEIS || undefined;
-
-    // Campo custom URL de origem (UF_CRM_ORIGIN_URL)
-    // Coloque no Vercel env: BITRIX_FIELD_ORIGIN_URL=UF_CRM_1763320747675 (se for o seu)
     const originUrlField = process.env.BITRIX_FIELD_ORIGIN_URL || "";
 
     const comments = buildComments({
       ...incoming,
       leadOrigin,
       listingCode,
-      listingUrl,
+      _resolvedListingUrl: listingUrl, // garante que aparece no comentário
       name,
       email,
       phone: phoneRaw,
     });
 
-    // Monta payload do Lead
     const leadFields = {
       TITLE: `DF Imóveis | ${listingCode} | ${name || "Novo Lead"}`,
       NAME: name || "",
       COMMENTS: comments,
     };
 
-    // Só seta SOURCE_ID se tiver valor (evita erro se ID não existir)
     if (sourceId) leadFields.SOURCE_ID = sourceId;
 
-    // Telefones/emails no formato Bitrix
     if (e164) {
       leadFields.PHONE = [{ VALUE: e164, VALUE_TYPE: "WORK" }];
     }
@@ -261,7 +294,6 @@ export default async function handler(req, res) {
       leadFields[originUrlField] = listingUrl;
     }
 
-    // Cria Lead
     const created = await callBitrix("crm.lead.add", { fields: leadFields });
     const leadId = created?.result;
 
@@ -270,6 +302,7 @@ export default async function handler(req, res) {
       leadId,
       listingCode,
       leadOrigin,
+      listingUrl,
       receivedMethod: req.method,
     });
   } catch (err) {
