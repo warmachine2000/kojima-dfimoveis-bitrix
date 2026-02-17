@@ -10,6 +10,8 @@
 // - Então o link principal do imóvel será SEMPRE do site Kojima:
 //   https://kojimaimoveis.com.br/Imovel/Detalhar?CodigoImovel=VILLAxxxx
 // - (Opcional) Se vier URL do DF, guardamos apenas como referência nos comentários.
+// - FONTE no Bitrix: usar SOURCE_ID correto do "Portal DF Imóveis" => STATUS_ID = "EMAIL"
+//   (configure na Vercel: BITRIX_SOURCE_ID_DFIMOVEIS=EMAIL)
 
 function onlyDigits(str = "") {
   return String(str).replace(/\D+/g, "");
@@ -240,8 +242,10 @@ export default async function handler(req, res) {
     // URL canônica de atendimento: Kojima
     const listingUrl = resolveKojimaListingUrl(incoming);
 
-    // Fonte (SOURCE_ID) — configure pra não cair em "Chamada"
-    const sourceId = process.env.BITRIX_SOURCE_ID_DFIMOVEIS || undefined;
+    // Fonte (SOURCE_ID) — Portal DF Imóveis no seu Bitrix é STATUS_ID="EMAIL"
+    // Configure na Vercel: BITRIX_SOURCE_ID_DFIMOVEIS=EMAIL
+    // (fallback hardcoded para garantir que não caia em "Chamada" se a env estiver ausente)
+    const sourceId = process.env.BITRIX_SOURCE_ID_DFIMOVEIS || "EMAIL";
 
     // Campo custom URL de origem (UF_CRM_ORIGIN_URL)
     const originUrlField = process.env.BITRIX_FIELD_ORIGIN_URL || "";
@@ -260,9 +264,8 @@ export default async function handler(req, res) {
       TITLE: `DF Imóveis | ${listingCode} | ${name || "Novo Lead"}`,
       NAME: name || "",
       COMMENTS: comments,
+      SOURCE_ID: sourceId, // <<< ajuste final
     };
-
-    if (sourceId) leadFields.SOURCE_ID = sourceId;
 
     if (e164) {
       leadFields.PHONE = [{ VALUE: e164, VALUE_TYPE: "WORK" }];
@@ -285,6 +288,7 @@ export default async function handler(req, res) {
       listingCode,
       leadOrigin,
       listingUrl,
+      sourceId,
       receivedMethod: req.method,
     });
   } catch (err) {
